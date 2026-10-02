@@ -98,6 +98,35 @@ They live under the machine-specific PaintAnalysis state directory, outside this
 repository. Set `PAINT_ANALYSIS_DISABLE_DEVELOPMENT_CACHE=1` before launch to
 disable automatic restoration.
 
+## Save and reopen Origami analysis
+
+Use **Save Analysis…** and **Load Analysis…** at the bottom of the Origami
+sidebar. After completing ROI or whole-image analysis, save a `.paintanalysis`
+file. Closing the app with Origami results open prompts to save, close without
+saving, or cancel. Choosing save closes only after a successful write; canceling
+the file dialog or a failed save keeps the app open.
+
+Load it in a later session to restore classifications, aligned particles,
+digital-pixel measurements, excluded/unclassified results, and any overlays
+already built. The selected classification, plot view, gallery page, and selected
+particle are restored when available. Use the Classification and View controls
+to inspect other saved results. Completed orientation/dropout diagnostics and
+threshold-sweep tables are preserved; older saves can regenerate these diagnostics
+from saved measurements without repeating detection or classification.
+
+The archive embeds localization tables, detection/classification template images,
+digital-group schemas, mirror/brightness settings, analysis parameters, and the
+custom type-count axis order. Original source and template files are not required
+to browse the saved analysis. Plots may render again on demand, but detection,
+alignment, and classification do not rerun during loading. Overlays that had not
+been built before saving can still be built from the saved aligned localizations.
+
+Saving/loading runs in the background with a progress dialog. Large full-image
+archives can take time and disk space because they include the source data.
+Saves replace the destination only after writing successfully. Files use a
+versioned ZIP archive of JSON and NumPy arrays, without executable pickle data.
+This is separate from the automatic drift-correction cache described above.
+
 ## Render And Drift
 
 The map uses Picasso Render directly:
@@ -370,7 +399,25 @@ Changing the template or detection settings requires rerunning Step 1. Each conn
 can group disconnected fiducials into one candidate, but cannot split or reuse
 a connected cluster for several fits. It retains the whole cluster as the
 alignment input, including signal outside the initial template proposal.
-Step 2 reuses the template selected in Step 1, fits it once per candidate, locks rotation and translation, and displays every fitted pose. **Max overlap (%)** in Step 2 sets the permitted intersection as a percentage
+Step 2 reuses the template selected in Step 1, fits it once per candidate, locks rotation and translation, and displays every fitted pose.
+Image-template fits always require independent fiducial support at both ends:
+the template is split at the midpoint of its widest axis, and at least half
+the marks in each half (rounded up) must meet **Pose min locs / site** within
+**Pose site radius**. Each localization contributes to only its nearest mark.
+This requirement remains active when correlation and optional corner gates are off.
+Fiducial scoring also remains active when later site-measurement gates are disabled.
+Interior refinement is discarded if it loses established fiducial support or
+increases any supported mark's residual by more than 0.25 nm. Residuals use the
+closest required number of localizations, so excess brightness does not add weight.
+
+After rerunning Step 2, select a candidate and choose **Alignment stages** in
+the panel selector. It shows the initial fit, fiducial refinement, whole-lattice
+refinement, lattice-centroid refinement, and final fit on matching source-coordinate
+axes. Each panel reports supported/required marks at both ends and whether the
+proposed adjustment was retained or discarded. Older results require rerunning
+Step 2 to populate this history.
+
+**Max overlap (%)** in Step 2 sets the permitted intersection as a percentage
 of the smaller active footprint. It defaults to **0%** (reject any overlap);
 100% allows all overlaps. Both fits are rejected above the threshold, even if
 their individual correlations pass. The
@@ -692,10 +739,53 @@ text statistics** is off; toggling diagnostics does not rerun fitting or change
 acceptance. The All templates overview shows diagnostics for its displayed
 assigned fits; select a template to inspect its rejected fits.
 
+### Mirror all Origami templates
+
+In **Origami → Identify → Step 1**, enable **Mirror all templates left–right**
+when the template orientation is reflected relative to your localization image.
+This global setting reflects the detection/alignment image, digital-pixel JSON
+site groups, and all classification templates together, including asymmetric
+column offsets and alignment marks. Group IDs, ON/OFF patterns, and brightness
+factors remain attached to their groups. The default is off.
+
+Rerun **Steps 1–4** after changing the setting. Existing results keep the
+orientation used when they were computed; cached alignment and digital
+measurements are not reused across different mirror settings. Tiled analysis
+uses the orientation of its saved identification run. Original template files
+are unchanged, and turning the option off restores their normal loaded
+orientation. The separate **Allow mirrored orientations** overlay setting
+continues to control orientation fitting.
+
+### Per-group brightness calibration
+
+Picklist Generator supports a positive `brightness_factor` on each entry in
+`logical_bits`. In its group editor, set **Brightness factor**, click **Update
+group**, then save the schema JSON. The default is `1`; older JSON files without
+this field retain their previous behavior. The factor also travels in exported
+PNG template metadata and JSON sidecars.
+
+Step 3 computes `adjusted support = weighted localizations / (group positions ×
+brightness_factor)`. A factor of `2` requires twice the usual signal, while
+`0.2` permits one-fifth. For example, at a support floor of 3, their raw weighted
+support floors per position are 6 and 0.6 respectively. The probability and
+prominence checks still apply, using the adjusted evidence. Factors do not
+change localization coordinates, site radius, or alignment requirements.
+
+Load the updated JSON with **Load Digital Pixel Groups JSON…**, then rerun
+Steps 3 and 4. The loaded Step 3 schema supplies the factors for classification
+regardless of factors embedded in older classification templates. Inspection
+statistics show adjusted support and the factor when it differs from 1; saved
+group support and downstream QC use this same adjusted scale.
+
 ### Exact digital-pixel classification
 
 Step 4 matches the complete ON/OFF pattern measured in Step 3 to the classification
-templates by digital-pixel ID. ON uses the same probability, minimum support,
+templates by digital-pixel ID. Candidates rejected by Step 2 alignment (including
+its correlation, point-count, fiducial, corner, and overlap gates) are excluded
+before lookup. They do not contribute to class counts, unclassified counts or
+galleries, or digital-group audit denominators. Saved candidate IDs remain
+available for alignment inspection, with an explicit excluded-alignment status.
+Rerun Step 4 to update previously saved lookup results. ON uses the same probability, minimum support,
 and minimum prominence thresholds as the displayed digital-group decisions.
 Every expected ON and OFF pixel must match. A unique matching template receives
 the object, subject to the existing fit-quality gates. Unknown patterns and

@@ -23,7 +23,7 @@ def review_tables(results, details=()):
         minimum.append(distance)
         group = {'assigned': 'Assigned', 'unmatched': f'No exact match: {distance} groups differ',
                  'rejected_exact': 'Exact match: QC rejected', 'ambiguous_exact': 'Ambiguous exact matches',
-                 'invalid': 'Invalid measurements'}[row.status]
+                 'invalid': 'Invalid measurements', 'excluded_alignment': 'Excluded: Step 2 alignment rejected'}[row.status]
         groups.append(group)
         reasons.append(failures or group)
     candidates['review_group'] = groups
@@ -85,7 +85,7 @@ def threshold_sweep(results, parameter='support', values=None):
         raise ValueError('Use up to 100 finite nonnegative thresholds; prominence must be between 0 and 1.')
     evidence = np.asarray(first['digital_group_localization_evidence'], dtype=float).reshape(n, len(ids))
     relative = np.asarray(first['digital_group_prominences'], dtype=float).reshape(n, len(ids))
-    valid = audit['candidates'].status.to_numpy() != 'invalid'
+    valid = ~audit['candidates'].status.isin(['invalid', 'excluded_alignment']).to_numpy()
     expected, eligible = [], []
     for name in names:
         p = results[name]['params']

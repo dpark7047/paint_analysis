@@ -60,6 +60,21 @@ class RoiCsvExportTests(unittest.TestCase):
             loaded.path = source.with_name('ordinary.csv')
             self.assertIsNone(roi_file_viewport_nm(loaded))
 
+    def test_bare_roi_filenames_with_nanometer_columns_restore_occupied_view(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ('raw_roi.csv', 'corrected_roi.csv', 'RAW_ROI.csv'):
+                with self.subTest(name=name):
+                    source = Path(directory) / name
+                    content = 'frameIndex,x (nm),y (nm)\n0,36000,37000\n1,72000,73000\n'
+                    source.write_text(content)
+                    loaded = read_locs_csv(source)
+                    original = loaded.locs.copy()
+                    bounds = PaintAnalysisApp._full_map_viewport_nm(SimpleNamespace(loaded=loaded))
+                    for actual, expected in zip(bounds, (35640., 72360., 36640., 73360.)):
+                        self.assertAlmostEqual(actual, expected, delta=.01)
+                    pd.testing.assert_frame_equal(loaded.locs, original)
+                    self.assertEqual(source.read_text(), content)
+
     def test_empty_roi_writes_header_and_source_is_protected(self):
         with tempfile.TemporaryDirectory() as directory:
             source = Path(directory) / 'locs.csv'

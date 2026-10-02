@@ -86,3 +86,10 @@ def test_selector_keeps_unclassified_selection():
     variable.set.assert_not_called()
     app.origami_template_result_combo.configure.assert_called_once_with(
         values=('All templates', 'code1', 'full', 'Unclassified'))
+
+
+def test_alignment_rejections_are_not_in_unclassified_gallery():
+    saved = results()
+    for payload in saved.values():
+        payload['params']['classification_lookup_eligible'] = (True, True, False, True)
+    np.testing.assert_array_equal(unclassified_display_payload(saved)['picks'].accepted_mask, [0, 0, 0, 1])

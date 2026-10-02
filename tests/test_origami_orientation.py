@@ -90,3 +90,18 @@ def test_symmetric_full_pattern_does_not_gain_groups():
     assert (rows.gained_on_count==0).all()
     assert (rows.exact_matches_0==rows.exact_matches_180).all()
     np.testing.assert_allclose(rows.correlation_change,0)
+
+
+def test_half_turn_reproduces_calls_with_group_brightness_factors():
+    results, grid, fiducials = fixture()
+    # Every group still has adjusted support 12; the dim group's raw 3
+    # localizations alone would fail the configured prominence gate.
+    original = np.repeat(grid, [24, 3, 12], axis=0)
+    for payload in results.values():
+        payload['picks'].aligned_regions = [original, -original]
+        payload['picks'].regions = [original, -original]
+        payload['params']['digital_pixel_model']['bit_brightness_factors'] = (2., 0.25, 1.)
+    audit = build_classification_audits(results)
+    rows = compare_half_turn(results, audit, grid, fiducials)['orientation_candidates']
+    assert rows.iloc[0].exact_matches_0 == 'full'
+    assert rows.iloc[1].exact_matches_180 == 'full'

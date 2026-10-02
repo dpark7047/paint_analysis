@@ -142,6 +142,10 @@ class DynamicRenderTests(unittest.TestCase):
         candidates = ([first], np.zeros((1, 1)), np.zeros((1, 1)), (0.0, 1.0, 0.0, 1.0), np.zeros((1, 1)))
         app = SimpleNamespace(
             origami_identification_running=False,
+            roi_nm=None,
+            origami_use_roi=FakeVariable(True),
+            origami_loaded_roi_nm=None,
+            load_origami_source_data=mock.Mock(),
             origami_source_points_nm=first,
             origami_loaded_source_path=Path("source.hdf5"),
             origami_staged_candidates=candidates,
@@ -157,12 +161,67 @@ class DynamicRenderTests(unittest.TestCase):
             _plot_origami_coarse_density=mock.Mock(),
             _run_worker=mock.Mock(),
         )
+        app._run_origami_candidate_stage = lambda: PaintAnalysisApp._run_origami_candidate_stage(app)
+        app._reload_origami_source_if_roi_changed = lambda callback: PaintAnalysisApp._reload_origami_source_if_roi_changed(app, callback)
 
         PaintAnalysisApp._run_origami_candidate_stage(app)
 
         app._run_worker.assert_not_called()
         app._plot_origami_coarse_density.assert_called_once_with()
         self.assertEqual(app.origami_step_progress[1].get(), 100.0)
+
+        # Selecting an ROI after loading the full image must bypass its cache
+        # and reload the source before any detection is dispatched.
+        app.roi_nm = (0.0, 0.5, 0.0, 0.5)
+        app._plot_origami_coarse_density.reset_mock()
+        PaintAnalysisApp._run_origami_candidate_stage(app)
+        app.load_origami_source_data.assert_called_once_with(on_loaded=app._run_origami_candidate_stage)
+        app._plot_origami_coarse_density.assert_not_called()
+        app._run_worker.assert_not_called()
+
+    def test_origami_roi_scope_refreshes_on_move_expand_clear_and_disable(self) -> None:
+        for selected, enabled, expected_reload in (
+            ((20., 10., 40., 30.), True, False),  # same bounds, reverse drag
+            ((11., 21., 30., 40.), True, True),
+            ((0., 100., 0., 100.), True, True),
+            (None, True, True),
+            ((10., 20., 30., 40.), False, True),
+        ):
+            with self.subTest(selected=selected, enabled=enabled):
+                app = SimpleNamespace(
+                    roi_nm=selected, origami_use_roi=FakeVariable(enabled),
+                    origami_loaded_roi_nm=(10., 20., 30., 40.),
+                    load_origami_source_data=mock.Mock(),
+                )
+                callback = mock.Mock()
+                self.assertEqual(
+                    PaintAnalysisApp._reload_origami_source_if_roi_changed(app, callback),
+                    expected_reload,
+                )
+                self.assertEqual(app.load_origami_source_data.call_count, int(expected_reload))
+                callback.assert_not_called()  # resume only after source loading finishes
+
+    def test_origami_source_reload_selects_current_roi_from_original_localizations(self) -> None:
+        locs = pd.DataFrame({"x": [1., 2., 8.], "y": [1., 2., 8.]})
+        app = SimpleNamespace(
+            loaded=SimpleNamespace(info=[{"Pixelsize": 10.}]),
+            corrected_locs=locs,
+        )
+        params = dict(source="Corrected localizations", use_roi=True, active_filters=[],
+                      source_path=Path("source.hdf5"), render_pixel_nm=5.,
+                      render_blur_method="none", render_min_blur_width=0.,
+                      render_viewport_nm=None, render_min_density=0., render_max_density=1.)
+        for roi, expected in (
+            ((25., 5., 25., 5.), [[10., 10.], [20., 20.]]),
+            ((75., 85., 75., 85.), [[80., 80.]]),
+            (None, [[10., 10.], [20., 20.], [80., 80.]]),
+        ):
+            with self.subTest(roi=roi), mock.patch("paint_analysis_gui.render_picasso_map", return_value={}):
+                kind, payload = PaintAnalysisApp._load_origami_source_worker(
+                    app, dict(params, source_roi_nm=roi))
+                self.assertEqual(kind, "origami_source")
+                np.testing.assert_array_equal(payload["points_nm"], expected)
+                self.assertEqual(payload["source_roi_nm"], roi)
 
     def test_step_one_cache_tracks_shared_fiducial_geometry(self) -> None:
         app = SimpleNamespace(
@@ -2058,7 +2117,9 @@ class DynamicRenderTests(unittest.TestCase):
         app.overlay_origamis.assert_called_once_with()
         self.assertEqual(app.origami_multi_template_overlays_building, {"type_a"})
 
-        app.origami_multi_template_overlay_results["type_a"] = {"result": object()}
+        app.origami_result = object()
+        app.origami_result_render_settings = {"pixel_size_nm": 0.5}
+        app.origami_multi_template_overlay_results["type_a"] = {"result": app.origami_result}
         app.origami_multi_template_overlays_building.clear()
         PaintAnalysisApp._auto_build_active_template_overlay(app)
         app.overlay_origamis.assert_called_once_with()

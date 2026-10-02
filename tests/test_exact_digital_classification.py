@@ -49,6 +49,28 @@ class ExactDigitalClassificationTests(unittest.TestCase):
         np.testing.assert_array_equal(result.winning_template_indices, [-1, 1, -1])
         self.assertEqual(result.counts.tolist(), [0, 1, 0])
 
+    def test_alignment_failures_are_excluded_even_when_pattern_matches(self):
+        params = self.params((True, False), [[.9, .1], [.9, .1], [.9, .9]])
+        params['_alignment_accepted_mask'] = (False, True, True)
+        matches = exact_digital_template_matches(params, 3)
+        np.testing.assert_array_equal(matches, [False, True, False])
+        centers = np.array([[0., 0.], [100., 0.], [200., 0.]])
+        result = classify_template_candidates([centers], [matches], [np.where(matches, 0., -np.inf)],
+                    match_distance_nm=1., require_unique_match=True,
+                    lookup_eligible_masks=[np.array([False, True, True])])
+        np.testing.assert_array_equal(result.winning_template_indices, [-4, 0, -1])
+        self.assertEqual(result.unclassified_count, 1)
+        self.assertEqual(result.counts.tolist(), [1])
+        np.testing.assert_array_equal(result.raw_template_probabilities[0], [0])
+
+    def test_all_alignment_failures_produce_zero_lookup_counts(self):
+        centers = np.array([[0., 0.], [100., 0.]])
+        result = classify_template_candidates([centers], [np.ones(2, bool)], [np.ones(2)],
+                    match_distance_nm=1., lookup_eligible_masks=[np.zeros(2, bool)])
+        self.assertEqual(result.unclassified_count, 0)
+        self.assertEqual(result.counts.tolist(), [0])
+        np.testing.assert_array_equal(result.winning_template_indices, [-4, -4])
+
     def test_missing_measurements_and_incompatible_ids_are_rejected(self):
         params = self.params((True, False), [[.9, .1]], template_ids=('a', 'c'))
         with self.assertRaisesRegex(ValueError, 'IDs'):

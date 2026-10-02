@@ -15,6 +15,7 @@ def compare_half_turn(results, audit, grid, fiducials):
     cells = model.get('bit_physical_cells', model.get('bit_cells', ()))
     order = [model_ids.index(bit) for bit in ids]
     groups = [cells[j] for j in order]
+    factors = np.asarray(model.get("bit_brightness_factors", (1.0,) * len(model_ids)), dtype=float)[order]
     regions = picks.aligned_regions
     n, g = len(regions), len(ids)
     if not n:
@@ -49,12 +50,12 @@ def compare_half_turn(results, audit, grid, fiducials):
     expected = np.asarray(expected)
     original_correlations = np.asarray(getattr(picks, 'rectangle_confidence', np.full(n,np.nan)),float)
     candidate_rows, group_rows, fiducial_rows = [], [], []
-    valid = audit['candidates'].status.to_numpy() != 'invalid'
+    valid = ~audit['candidates'].status.isin(['invalid', 'excluded_alignment']).to_numpy()
     for index, original in enumerate(regions):
         comparisons = []
         for degrees in (0,180):
             points = np.asarray(original,float) * (1 if degrees==0 else -1)
-            evidence = direct_digital_group_localization_evidence([points],grid,groups,assignment_radius_nm=radius)
+            evidence = direct_digital_group_localization_evidence([points],grid,groups,assignment_radius_nm=radius, brightness_factors=factors)
             raw = digital_group_template_evidence(evidence,[False]*g,groups)[2]
             prob = digital_group_template_evidence(evidence,[False]*g,groups,
                 minimum_support_per_position=support,minimum_group_prominence=prominence)[2]

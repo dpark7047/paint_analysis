@@ -149,3 +149,15 @@ def test_audit_export_uses_weighted_mixture():
     audit = build_classification_audits(saved)
     assert audit['metadata']['expected_template_fractions'] == {'empty': 1/3, 'code3': 2/3}
     assert audit['group_summary'].iloc[0].mixture_expected_on_fraction == pytest.approx(2/3)
+
+
+def test_alignment_failures_are_excluded_from_audit_denominators():
+    results = fixture_results()
+    for payload in results.values():
+        payload['params']['classification_lookup_eligible'] = (True, False, True, True)
+    audit = build_classification_audits(results)
+    assert audit['candidates'].status.tolist() == ['assigned', 'excluded_alignment', 'unmatched', 'invalid']
+    assert audit['metadata']['excluded_alignment_count'] == 1
+    assert audit['metadata']['invalid_count'] == 1
+    assert audit['group_summary'].iloc[0].candidates == 2
+    assert audit['candidate_template_distances'].query('candidate_id == 2').empty

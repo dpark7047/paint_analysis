@@ -92,7 +92,7 @@ def fit_dropout_models(results, audit, seed=1729):
     if len(np.unique(templates,axis=0)) != len(templates):
         raise ValueError('Dropout comparison requires distinct template patterns.')
     candidates = audit['candidates']
-    valid = candidates.status != 'invalid'
+    valid = ~candidates.status.isin(['invalid', 'excluded_alignment'])
     observed = np.array([[int(bit) for bit in p] for p in candidates.loc[valid,'pattern']], dtype=float)
     n = len(observed)
     if n < max(30, 3*g):

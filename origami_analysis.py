@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from time import monotonic
 from functools import lru_cache
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
@@ -93,6 +94,7 @@ class OrigamiPickResult:
     alignment_reference_image: np.ndarray
     alignment_candidate_images: np.ndarray
     footprint_overlap_fraction: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=float))
+    alignment_pose_history: list[list[dict]] = field(default_factory=list)
 
     @property
     def accepted_regions(self) -> list[np.ndarray]:
@@ -195,6 +197,8 @@ def concatenate_origami_pick_results(results: list[OrigamiPickResult]) -> Origam
         alignment_canvas_side_nm=float(first.alignment_canvas_side_nm),
         alignment_reference_image=np.asarray(first.alignment_reference_image).copy(),
         alignment_candidate_images=concatenate("alignment_candidate_images"),
+        alignment_pose_history=[history for result in results for history in
+                                (result.alignment_pose_history or [[] for _ in result.regions])],
         footprint_overlap_fraction=np.concatenate([
             result.footprint_overlap_fraction if len(result.footprint_overlap_fraction) == len(result.regions)
             else np.zeros(len(result.regions)) for result in results
@@ -695,6 +699,7 @@ def direct_digital_group_localization_evidence(
     digital_group_cells: Sequence[Sequence[int]],
     *,
     assignment_radius_nm: float,
+    brightness_factors: Sequence[float] | None = None,
 ) -> np.ndarray:
     """Measure digital groups directly from aligned localization coordinates.
 
@@ -708,7 +713,9 @@ def direct_digital_group_localization_evidence(
 
     Values are returned as localization support per member position. This makes
     groups containing different numbers of positions comparable without turning
-    those positions into independently classified analog bits.
+    those positions into independently classified analog bits. Divide by each
+    group's expected brightness factor before probability and prominence scoring.
+    A factor of 2 requires twice the signal; 0.2 permits one-fifth.
     """
     grid = np.asarray(lattice_points_nm, dtype=float)
     if grid.ndim != 2 or grid.shape[1:] != (2,):
@@ -725,6 +732,10 @@ def direct_digital_group_localization_evidence(
         if np.any(cells < 0) or np.any(cells >= len(grid)):
             raise ValueError("Digital-group position is outside the template lattice.")
 
+    factors = np.ones(len(groups)) if brightness_factors is None else np.asarray(brightness_factors, dtype=float)
+    if factors.shape != (len(groups),) or not np.all(np.isfinite(factors)) or np.any(factors <= 0):
+        raise ValueError("Brightness factors must contain one positive finite value per digital group.")
+
     evidence = np.zeros((len(aligned_regions), len(groups)), dtype=float)
     group_trees = [cKDTree(grid[cells]) for cells in groups]
     radius_squared = radius * radius
@@ -740,7 +751,7 @@ def direct_digital_group_localization_evidence(
         )
         evidence[region_index] = np.sum(responsibilities, axis=0) / np.asarray(
             [len(cells) for cells in groups], dtype=float
-        )
+        ) / factors
     return evidence
 
 
@@ -1278,6 +1289,7 @@ def classify_template_candidates(
     deduplication_distance_nm: float | None = None,
     minimum_winner_probability: float | None = None,
     require_unique_match: bool = False,
+    lookup_eligible_masks: list[np.ndarray] | None = None,
 ) -> TemplateClassificationResult:
     """Match duplicate detections across templates and select one accepted fit per object."""
     template_count = len(candidate_centers_by_template)
@@ -1300,6 +1312,18 @@ def classify_template_candidates(
         if len(centers) != len(accepted) or len(centers) != len(scores):
             raise ValueError("Candidate centers, acceptance masks, and correlations must have matching lengths.")
         centers_by_template.append(centers)
+
+    # Keep stable candidate IDs for inspection, but exclude failed upstream
+    # alignment poses from probabilities, matching, and unclassified counts.
+    if lookup_eligible_masks is None:
+        lookup_eligible_masks = [np.ones(len(centers), dtype=bool) for centers in centers_by_template]
+    if len(lookup_eligible_masks) != template_count:
+        raise ValueError("Lookup eligibility must describe every template.")
+    lookup_eligible_masks = [np.asarray(mask, dtype=bool) for mask in lookup_eligible_masks]
+    if any(mask.shape != (len(centers),) for mask, centers in zip(lookup_eligible_masks, centers_by_template)):
+        raise ValueError("Lookup eligibility must match candidate counts.")
+    accepted_masks = [np.asarray(mask, dtype=bool) & eligible
+                      for mask, eligible in zip(accepted_masks, lookup_eligible_masks)]
 
     # The normal multi-template path evaluates the exact same physical
     # candidates in the same order. Preserve those stable candidate IDs
@@ -1361,6 +1385,8 @@ def classify_template_candidates(
         group_scores = np.full(template_count, -float("inf"), dtype=float)
         eligible = np.zeros(template_count, dtype=bool)
         for template_index, candidate_index in group.items():
+            if not lookup_eligible_masks[template_index][candidate_index]:
+                continue
             group_scores[template_index] = float(correlations[template_index][candidate_index])
             eligible[template_index] = bool(accepted_masks[template_index][candidate_index])
         finite = np.isfinite(group_scores)
@@ -1380,6 +1406,9 @@ def classify_template_candidates(
     winning_score_margins = np.full(len(groups), np.nan, dtype=float)
     winning_candidates: list[tuple[int, int] | None] = [None] * len(groups)
     for group_index, group in enumerate(groups):
+        if not any(lookup_eligible_masks[t][i] for t, i in group.items()):
+            winning_template_indices[group_index] = -4  # Excluded before lookup.
+            continue
         passing = [
             (float(correlations[template_index][candidate_index]), template_index, candidate_index)
             for template_index, candidate_index in group.items()
@@ -2054,11 +2083,17 @@ def _pick_template_supported_regions(
     sites = sites - (np.min(sites, axis=0) + np.max(sites, axis=0)) / 2.0
     if np.max(np.ptp(sites, axis=0)) <= 0.0:
         raise ValueError("Candidate template sites must span a nonzero distance.")
+    if progress_callback is not None:
+        progress_callback(15.0, "Selecting density-supported bins for fiducial detection…")
     active = (contrast >= density_threshold) & (density > 0.0)
     labels = np.full(contrast.shape, -1, dtype=np.int32)
     active_indices = np.argwhere(active)
     if not len(active_indices):
+        if progress_callback is not None:
+            progress_callback(100.0, "Recovered 0 bounded fiducial candidates: no density-supported bins.")
         return [], density, contrast, extent, labels
+    if progress_callback is not None:
+        progress_callback(20.0, "Indexing density-supported bins and preparing fiducial search maps…")
     origin = np.array([extent[0], extent[2]]) + bin_size_nm / 2.0
     cells = origin + active_indices * bin_size_nm
     cell_tree = cKDTree(cells)
@@ -2070,6 +2105,11 @@ def _pick_template_supported_regions(
     radius_bins = int(np.ceil(np.max(np.linalg.norm(sites, axis=1)) / bin_size_nm)) + 1
     kernel_shape = (2 * radius_bins + 1,) * 2
     for angle_index, degrees in enumerate(range(0, 360, 5)):
+        if progress_callback is not None:
+            progress_callback(
+                25.0 + 50.0 * angle_index / 72.0,
+                f"Searching bounded fiducial poses: rotation {angle_index + 1}/72 ({degrees}°)…",
+            )
         angle = np.deg2rad(degrees)
         rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
         offsets = np.rint(sites @ rotation.T / bin_size_nm).astype(int)
@@ -2084,14 +2124,24 @@ def _pick_template_supported_regions(
         better = score > best_score
         best_score[better] = score[better]
         best_angle[better] = angle
-        if progress_callback is not None and angle_index % 12 == 0:
-            progress_callback(25.0 + 50.0 * angle_index / 72.0, "Searching bounded fiducial poses…")
+    if progress_callback is not None:
+        progress_callback(75.0, "Extracting candidate peaks from fiducial search scores…")
     peak_mask = np.isfinite(best_score) & (best_score >= maximum_filter(best_score, size=3))
     peaks = np.argwhere(peak_mask)
+    if progress_callback is not None:
+        progress_callback(77.0, f"Ranking {len(peaks):,} candidate poses by fiducial score…")
     ranking = np.argsort(-best_score[peak_mask], kind="stable")
+    if progress_callback is not None:
+        progress_callback(79.0, f"Building spatial index for {len(points_nm):,} localizations…")
     point_tree = cKDTree(points_nm)
+    if progress_callback is not None:
+        progress_callback(81.0, "Finding the nearest density-supported bin for each localization…")
     recovery_distance, nearest_cell = cell_tree.query(points_nm)
+    if progress_callback is not None:
+        progress_callback(84.0, "Labeling connected density-supported clusters…")
     coarse_labels, coarse_count = label(active, structure=np.ones((3, 3), dtype=int))
+    if progress_callback is not None:
+        progress_callback(86.0, f"Grouping localizations into {coarse_count:,} connected clusters…")
     cell_clusters = coarse_labels[tuple(active_indices.T)] - 1
     point_clusters = cell_clusters[nearest_cell]
     recoverable = np.flatnonzero(recovery_distance <= connect_distance_nm)
@@ -2105,7 +2155,19 @@ def _pick_template_supported_regions(
     half_size = np.ptp(sites, axis=0) / 2.0 + connect_distance_nm
     search_radius = float(np.linalg.norm(half_size))
     regions = []
-    for peak in peaks[ranking]:
+    last_progress_time = -math.inf
+    for peak_index, peak in enumerate(peaks[ranking]):
+        # Report before checking a pose so rejected poses advance progress too.
+        # Throttle UI events by time, since the number and cost of poses vary.
+        if progress_callback is not None:
+            now = monotonic()
+            if now - last_progress_time >= 0.25:
+                progress_callback(
+                    88.0 + 10.0 * peak_index / len(peaks),
+                    f"Checking candidate pose {peak_index + 1:,}/{len(peaks):,} "
+                    f"for fiducial support and cluster overlap; {len(regions):,} candidates retained…",
+                )
+                last_progress_time = now
         center = origin + peak * bin_size_nm
         angle = best_angle[tuple(peak)]
         rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
@@ -2136,6 +2198,11 @@ def _pick_template_supported_regions(
         region_index = len(regions)
         regions.append(points_nm[indices])
         cluster_owners[clusters] = region_index
+    if progress_callback is not None:
+        progress_callback(
+            98.0,
+            f"Checked {len(peaks):,} candidate poses; finalizing labels for {len(regions):,} retained candidates…",
+        )
     labels[tuple(active_indices.T)] = cluster_owners[cell_clusters]
     if progress_callback is not None:
         progress_callback(100.0, f"Recovered {len(regions):,} bounded fiducial candidates.")
@@ -3438,6 +3505,52 @@ def _sparse_pose_quality(
     )
 
 
+def alignment_fiducial_groups(template_points_nm: np.ndarray) -> list[np.ndarray]:
+    """Split marks into two physical ends along the template's widest axis.
+
+    Groups depend only on calibrated template geometry, never observed brightness.
+    At least half the marks in each group (rounded up) must be supported.
+    """
+    sites = np.asarray(template_points_nm, dtype=float).reshape(-1, 2)
+    if len(sites) < 2:
+        return [np.arange(len(sites))] if len(sites) else []
+    axis = int(np.argmax(np.ptp(sites, axis=0)))
+    middle = (sites[:, axis].min() + sites[:, axis].max()) / 2.0
+    return [indices for indices in (np.flatnonzero(sites[:, axis] <= middle),
+                                    np.flatnonzero(sites[:, axis] > middle)) if len(indices)]
+
+
+def alignment_fiducial_support(points, sites, radius_nm, minimum_localizations):
+    """Measure independent end support without counting a point at multiple marks."""
+    sites = np.asarray(sites, dtype=float).reshape(-1, 2)
+    groups = alignment_fiducial_groups(sites)
+    counts = np.zeros(len(sites), dtype=int)
+    residuals = np.full(len(sites), np.inf)
+    if len(points) and len(sites):
+        distances, nearest = cKDTree(sites).query(points)
+        for index in range(len(sites)):
+            local = distances[(nearest == index) & (distances <= radius_nm)]
+            counts[index] = len(local)
+            if len(local) >= minimum_localizations:
+                closest = np.partition(local, minimum_localizations - 1)[:minimum_localizations]
+                residuals[index] = float(np.sqrt(np.mean(closest ** 2)))
+    supported = counts >= minimum_localizations
+    group_counts = np.array([np.count_nonzero(supported[group]) for group in groups], dtype=int)
+    required = np.array([max(1, int(np.ceil(len(group) / 2))) for group in groups], dtype=int)
+    return dict(counts=counts, supported=group_counts, required=required,
+                passed=bool(len(groups) and np.all(group_counts >= required)),
+                residuals=residuals)
+
+
+def _preserves_fiducial_support(before, after) -> bool:
+    """Never trade an end's supported marks or established precision for interior fit."""
+    established = np.isfinite(before["residuals"])
+    return bool(
+        np.all(after["supported"] >= before["supported"])
+        and np.all(after["residuals"][established] <= before["residuals"][established] + 0.25)
+    )
+
+
 def _refine_sparse_grid_pose(
     aligned_region: np.ndarray,
     grid_points_nm: np.ndarray,
@@ -3789,6 +3902,7 @@ def _align_regions_by_image_correlation(
     progress_callback: Callable[[float, str], None] | None = None,
     aligned_image_output: list[np.ndarray] | None = None,
     candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
+    pose_history_output: list[list[dict]] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     """Independently classify and rigidly align candidates to the theoretical grid image."""
     if requested_pixel_nm <= 0:
@@ -3879,11 +3993,30 @@ def _align_regions_by_image_correlation(
             pixel_nm,
             max(pixel_nm, 1.5),
         )
+    if uses_custom_template:
+        # Site-measurement gates may be disabled in Step 2; fiducial alignment
+        # must remain active independently of those later measurement gates.
+        sparse_pose_site_count = max(1, sparse_pose_site_count)
     template_polar_fft = np.fft.rfft(_polar_image(template), axis=0)
     angles = np.zeros(len(images), dtype=float)
     shifts = np.zeros((len(images), 2), dtype=float)
     aligned_images = images.copy()
     correlations = np.full(len(images), -1.0, dtype=float)
+    histories = [[] for _ in regions]
+
+    def support(points):
+        return alignment_fiducial_support(points, template_points_nm,
+                                          sparse_site_radius_nm, sparse_min_site_localizations)
+
+    def record(index, stage, rotation, offset, points, accepted=True):
+        evidence = support(points)
+        histories[index].append(dict(
+            stage=stage, accepted=accepted,
+            world_sites=(np.asarray(template_points_nm) + offset) @ rotation + centers[index],
+            groups=[group.tolist() for group in alignment_fiducial_groups(template_points_nm)],
+            supported=evidence["supported"].tolist(), required=evidence["required"].tolist(),
+            passed=evidence["passed"],
+        ))
     total_alignment_work = iterations * len(images)
     alignment_progress_every = max(1, total_alignment_work // 40)
     for iteration in range(iterations):
@@ -3902,6 +4035,7 @@ def _align_regions_by_image_correlation(
                 trial_angles = angles[index] + refinement_step * np.asarray([-1.0, -0.5, 0.0, 0.5, 1.0])
             best_score = -float("inf")
             best_pose_quality = -float("inf")
+            best_support_rank = (-1, -1.0)
             best_shift_x = 0.0
             best_shift_y = 0.0
             best_angle = float(angles[index])
@@ -3983,9 +4117,13 @@ def _align_regions_by_image_correlation(
                     # toward their strokes. Keep raster correlation only as a
                     # deterministic tie-breaker and reported QC measurement.
                     selection_quality = pose_quality
-                    if selection_quality > best_pose_quality or (
-                        abs(selection_quality - best_pose_quality) <= 1e-12 and score > best_score
-                    ):
+                    support_rank = (0, 0.0)
+                    if uses_custom_template and sparse_pose_site_count > 0:
+                        evidence = support(refined_points)
+                        support_rank = (int(evidence["passed"]), float(min(1.0, np.min(
+                            evidence["supported"] / evidence["required"]))))
+                    if (support_rank, selection_quality, score) > (best_support_rank, best_pose_quality, best_score):
+                        best_support_rank = support_rank
                         best_pose_quality = selection_quality
                         best_score = score
                         best_shift_x = float(fitted_shift[0] / pixel_nm)
@@ -4020,6 +4158,24 @@ def _align_regions_by_image_correlation(
             )
             shift_nm = np.asarray(shifts[index], dtype=float) * pixel_nm
             provisional = (region - center) @ raw_rotation.T - shift_nm
+            record(index, "Initial fit", raw_rotation, shift_nm, provisional)
+            corrected = provisional
+            combined_rotation = raw_rotation
+            corrected_shift_nm = shift_nm
+
+            def apply_refinement(stage, correction, offset):
+                nonlocal corrected, combined_rotation, corrected_shift_nm
+                proposed = corrected @ correction.T + offset
+                proposed_rotation = correction @ combined_rotation
+                proposed_shift = corrected_shift_nm @ correction.T - offset
+                accepted = not uses_custom_template or _preserves_fiducial_support(
+                    support(corrected), support(proposed))
+                record(index, stage, proposed_rotation, proposed_shift, proposed, accepted)
+                if accepted:
+                    corrected = proposed
+                    combined_rotation = proposed_rotation
+                    corrected_shift_nm = proposed_shift
+
             correction, correction_offset, _contrast_score = (
                 _refine_pose_by_alignment_site_contrast(
                     provisional,
@@ -4028,9 +4184,7 @@ def _align_regions_by_image_correlation(
                     minimum_site_localizations=sparse_min_site_localizations,
                 )
             )
-            corrected = provisional @ correction.T + correction_offset
-            combined_rotation = correction @ raw_rotation
-            corrected_shift_nm = shift_nm @ correction.T - correction_offset
+            apply_refinement("Fiducial refinement", correction, correction_offset)
             if refinement_grid_points_nm is not None and len(refinement_grid_points_nm):
                 lattice_correction, lattice_offset, _lattice_score = (
                     _refine_pose_by_full_lattice(
@@ -4041,11 +4195,7 @@ def _align_regions_by_image_correlation(
                         minimum_site_localizations=sparse_min_site_localizations,
                     )
                 )
-                corrected = corrected @ lattice_correction.T + lattice_offset
-                combined_rotation = lattice_correction @ combined_rotation
-                corrected_shift_nm = (
-                    corrected_shift_nm @ lattice_correction.T - lattice_offset
-                )
+                apply_refinement("Whole-lattice refinement", lattice_correction, lattice_offset)
                 centroid_correction, centroid_offset, _site_count, _site_rms = (
                     _refine_pose_from_lattice_centroids(
                         corrected,
@@ -4054,11 +4204,10 @@ def _align_regions_by_image_correlation(
                         minimum_site_localizations=sparse_min_site_localizations,
                     )
                 )
-                corrected = corrected @ centroid_correction.T + centroid_offset
-                combined_rotation = centroid_correction @ combined_rotation
-                corrected_shift_nm = (
-                    corrected_shift_nm @ centroid_correction.T - centroid_offset
-                )
+                apply_refinement("Lattice-centroid refinement", centroid_correction, centroid_offset)
+            record(index, "Final fit", combined_rotation, corrected_shift_nm, corrected)
+            if progress_callback:
+                progress_callback(72.0, f"Refining and checking fiducial support: candidate {index + 1:,}/{len(regions):,}…")
             angles[index] = -float(
                 np.rad2deg(
                     np.arctan2(combined_rotation[1, 0], combined_rotation[0, 0])
@@ -4075,6 +4224,8 @@ def _align_regions_by_image_correlation(
             aligned_images[index] = corrected_image
             correlations[index] = _boundary_template_correlation(corrected_image, template)
 
+    if pose_history_output is not None:
+        pose_history_output.extend(histories)
     if aligned_image_output is not None:
         aligned_image_output.extend(image.copy() for image in aligned_images)
     aligned_regions: list[np.ndarray] = []
@@ -4321,6 +4472,7 @@ def identify_origami_regions(
     rectangle_matched_sites: list[int] = []
     rectangle_fit_rms: list[float] = []
     aligned_candidate_images: list[np.ndarray] = []
+    alignment_pose_history: list[list[dict]] = []
     grid = np.empty((0, 2), dtype=float)
     if (
         rows is not None
@@ -4380,6 +4532,7 @@ def identify_origami_regions(
                 template_pixel_size_y_nm=template_pixel_size_y_nm,
                 progress_callback=progress_callback,
                 aligned_image_output=aligned_candidate_images,
+                pose_history_output=alignment_pose_history,
                 candidate_image_cache=candidate_image_cache,
             )
         )
@@ -4544,6 +4697,11 @@ def identify_origami_regions(
         & (supported_column_counts >= min_supported_columns)
         & (site_spacing_max_errors <= max_site_spacing_error_nm)
     )
+    if alignment_template_image is not None:
+        accepted_mask &= np.asarray([
+            alignment_fiducial_support(region, grid, site_mask_radius_nm, min_site_localizations)["passed"]
+            for region in aligned_regions
+        ], dtype=bool)
     if require_corner_support and alignment_template_image is not None:
         corner_counts = alignment_corner_counts(aligned_regions, grid, site_mask_radius_nm)
         accepted_mask &= np.all(corner_counts >= min_site_localizations, axis=1)
@@ -4610,6 +4768,7 @@ def identify_origami_regions(
         alignment_reference_image=reference,
         alignment_candidate_images=np.asarray(aligned_candidate_images, dtype=np.float32),
         footprint_overlap_fraction=footprint_overlap_fraction,
+        alignment_pose_history=alignment_pose_history,
     )
     if progress_callback:
         progress_callback(

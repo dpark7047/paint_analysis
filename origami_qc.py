@@ -99,6 +99,11 @@ def build_classification_audits(results):
     if np.any(accepted.sum(axis=1) > 1):
         raise ValueError("A candidate has multiple saved assignments. Rerun Step 4.")
     valid = np.logical_and.reduce([np.isfinite(a).all(axis=1) for a in arrays])
+    lookup_eligible = np.asarray(params.get("classification_lookup_eligible",
+                                params.get("_alignment_accepted_mask", np.ones(n, dtype=bool))), dtype=bool)
+    if lookup_eligible.shape != (n,):
+        raise ValueError("Saved lookup eligibility is incomplete. Rerun Step 4.")
+    valid &= lookup_eligible
     support_pass = evidence >= support_min
     prominence_pass = prominence >= prominence_min
     probability_pass = probability >= .5
@@ -111,6 +116,8 @@ def build_classification_audits(results):
     statuses = np.where(~valid, "invalid", np.where(assigned, "assigned",
         np.where(matches.sum(axis=1) == 0, "unmatched",
         np.where(matches.sum(axis=1) == 1, "rejected_exact", "ambiguous_exact"))))
+    statuses = statuses.astype(object)
+    statuses[~lookup_eligible] = "excluded_alignment"
     labels = [names[np.argmax(row)] if row.any() else "" for row in accepted]
     patterns = ["".join("1" if b else "0" for b in row) if ok else ""
                 for row, ok in zip(states, valid)]
@@ -189,7 +196,7 @@ def build_classification_audits(results):
         full_dropout_comparisons=pd.DataFrame(dropout, columns=["full_template", "comparison_template", "absent_groups", "absent_group_count", "observed_exact_pattern", "assigned_count"]),
         metadata=dict(group_order=ids, template_names=names, candidate_count=n,
             expected_template_fractions=dict(zip(names, expected_template_fractions(names).tolist())),
-            invalid_count=int((~valid).sum()), support_threshold=support_min, prominence_threshold=prominence_min,
+            invalid_count=int((~valid & lookup_eligible).sum()), excluded_alignment_count=int((~lookup_eligible).sum()), support_threshold=support_min, prominence_threshold=prominence_min,
             notes="Read-only audit. Nearest patterns and full-dropout comparisons are hypotheses, not truth labels. Mixture reference gives code3 twice the weight of other templates; it is not a classifier prior. Gate failure counts can overlap. Candidate IDs index the saved shared candidates; undetected objects are not included. Support-only scores are not calibrated class probabilities."))
 
 
@@ -226,7 +233,7 @@ def plot_classification_audit(figure, audit, view):
                 right.text(k, j, str(values[j, k]), ha="center", va="center",
                            color="white" if values[j, k] > values.max() * .65 else "black")
         total = int(rows.iloc[0].candidates)
-        figure.suptitle(f"Digital-group threshold audit: {total:,} valid candidates; {audit['metadata']['invalid_count']:,} invalid excluded")
+        figure.suptitle(f"Digital-group threshold audit: {total:,} valid candidates; {audit['metadata']['invalid_count']:,} invalid; {audit['metadata'].get('excluded_alignment_count', 0):,} alignment failures excluded")
     else:
         top, bottom = figure.subplots(2, 1, gridspec_kw={"height_ratios": [3, 1]})
         patterns = audit["unmatched_patterns"].head(20)
