@@ -38,8 +38,6 @@ from matplotlib.widgets import RectangleSelector
 
 from analysis_session import save_analysis_session, load_analysis_session
 
-from origami_orientation import compare_half_turn, plot_half_turn
-from origami_dropout import fit_dropout_models, plot_dropout_models
 from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
                            plot_evidence, plot_sweep, plot_full_detail)
 from origami_qc import (build_classification_audits, export_classification_audits,
@@ -4979,7 +4977,7 @@ class PaintAnalysisApp(tk.Tk):
             values=("All unclassified",), state="readonly", width=24)
         self.origami_review_combo.grid(row=1, column=0, sticky="ew")
         self.origami_review_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_origami_gallery_view())
-        ttk.Button(review_fields, text="Why wasn't this full?", command=self._show_origami_full_review).grid(row=2, column=0, sticky="ew", pady=4)
+        ttk.Button(review_fields, text="Digital bit derivation", command=self._show_origami_full_review).grid(row=2, column=0, sticky="ew", pady=4)
         ttk.Label(review_fields, text="Sweep one threshold (other gates fixed)", wraplength=240).grid(row=3, column=0, sticky="w")
         ttk.Combobox(review_fields, textvariable=self.origami_sweep_parameter, values=("support", "prominence"),
                      state="readonly", width=24).grid(row=4, column=0, sticky="ew")
@@ -5052,24 +5050,20 @@ class PaintAnalysisApp(tk.Tk):
             "Coarse identification density",
             "Identified origami template matches",
             "Origami type counts",
-            "Classification diagnostics",
             "Digital-group bias heatmap",
             "Digital-group threshold audit",
             "Unmatched-pattern audit",
             "Unclassified evidence distributions",
             "Threshold sensitivity",
-            "ON-dropout model check",
-            "180° orientation check",
             "Digital-pixel spatial heatmap",
             "Individual origami gallery",
             "Individual site assignments",
             "Selected origami detail",
-            "Why wasn’t this full?",
+            "Digital bit derivation",
             "Aligned density",
             "Integrated density per site",
             "Mean site counts",
             "Site occupancy",
-            "Occupied-site completeness",
         )
         self.origami_all_plot_options = plot_options
         self.origami_plot_combo = ttk.Combobox(
@@ -5385,14 +5379,11 @@ class PaintAnalysisApp(tk.Tk):
         if hasattr(self, "origami_plot_combo"):
             classification_diagnostic_options = (
                 "Origami type counts",
-                "Classification diagnostics",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap",
             )
             identification_options: tuple[str, ...] = ()
@@ -5845,7 +5836,7 @@ class PaintAnalysisApp(tk.Tk):
             "Random ROI inspection",
         }:
             return "roi"
-        if self.origami_last_rendered_plot_option in {"Selected origami detail", "Why wasn’t this full?"}:
+        if self.origami_last_rendered_plot_option in {"Selected origami detail", "Digital bit derivation"}:
             return "detail"
         return "none"
 
@@ -5993,7 +5984,7 @@ class PaintAnalysisApp(tk.Tk):
         requested = max(1, min(result.origami_count, requested))
         self.origami_selected_index = requested - 1
         self.origami_detail_number.set(requested)
-        if self.origami_plot_option.get() != "Why wasn’t this full?":
+        if self.origami_plot_option.get() != "Digital bit derivation":
             self.origami_plot_option.set("Selected origami detail")
         self.render_origami_plot()
 
@@ -6012,11 +6003,9 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_result = None
             if requested_view == "Origami type counts":
                 self._plot_origami_type_counts()
-            elif requested_view == "Classification diagnostics":
-                self._plot_classification_diagnostics()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
-            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity"):
                 self._plot_origami_audit(requested_view)
             elif requested_view == "Digital-group bias heatmap":
                 self._plot_digital_group_bias_heatmap()
@@ -6052,11 +6041,9 @@ class PaintAnalysisApp(tk.Tk):
                 self._plot_origami_coarse_density()
             elif requested_view == "Origami type counts":
                 self._plot_origami_type_counts()
-            elif requested_view == "Classification diagnostics":
-                self._plot_classification_diagnostics()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
-            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+            elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity"):
                 self._plot_origami_audit(requested_view)
             elif requested_view == "Digital-group bias heatmap":
                 self._plot_digital_group_bias_heatmap()
@@ -11326,10 +11313,6 @@ class PaintAnalysisApp(tk.Tk):
                                     f"{result_payload['tile_count']:,} selected complete {width_nm:g} × {height_nm:g} nm ROIs "
                                     f"({tile_summary})."
                                 )
-                        elif result_kind == "origami_orientation":
-                            self._finish_origami_orientation(result_payload)
-                        elif result_kind == "origami_dropout":
-                            self._finish_origami_dropout(result_payload)
                         elif result_kind == "origami":
                             if self.loaded is not None and result_payload.get("source_path") == self.loaded.path:
                                 self._plot_origami_analysis(result_payload)
@@ -14879,13 +14862,10 @@ class PaintAnalysisApp(tk.Tk):
         if option == "Origami type counts":
             self._plot_origami_type_counts()
             return
-        if option == "Classification diagnostics":
-            self._plot_classification_diagnostics()
-            return
         if option == "Digital-pixel spatial heatmap":
             self._plot_digital_pixel_spatial_heatmap()
             return
-        if option in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity", "ON-dropout model check", "180° orientation check"):
+        if option in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity"):
             self._plot_origami_audit(option)
             return
         if option == "Digital-group bias heatmap":
@@ -14907,7 +14887,7 @@ class PaintAnalysisApp(tk.Tk):
             self._plot_identified_origamis()
             return
 
-        if option == "Why wasn’t this full?":
+        if option == "Digital bit derivation":
             self._plot_origami_full_review()
             return
         result = self.origami_result
@@ -15038,20 +15018,6 @@ class PaintAnalysisApp(tk.Tk):
                 vmin=0.0,
                 vmax=100.0,
             )
-        elif option == "Occupied-site completeness":
-            occupied_per_origami = np.sum(result.site_occupancy, axis=1)
-            bin_step = 0.5 if result.symmetrized_180 else 1.0
-            edges = np.arange(-bin_step / 2.0, result.rows * result.columns + bin_step, bin_step)
-            axis.hist(occupied_per_origami, bins=edges, color="#2563eb", edgecolor="white")
-            axis.set_xticks(np.arange(0, result.rows * result.columns + bin_step, bin_step))
-            axis.set_xlabel("occupied sites per origami (0°/180° average)")
-            axis.set_ylabel("origami count")
-            axis.set_title(
-                "Per-origami completeness (accepted docking-site clusters)\n"
-                f"median RMS {np.median(result.alignment_rms_nm):.2f} nm; median grid match "
-                f"{100.0 * np.median(result.grid_match_fraction):.1f}%; {result.rejected_candidate_count} rejected"
-            )
-            axis.grid(True, axis="y", alpha=0.25)
         else:
             axis.text(0.5, 0.5, f"Unknown plot option: {option}", ha="center", va="center", transform=axis.transAxes)
 
@@ -15291,12 +15257,12 @@ class PaintAnalysisApp(tk.Tk):
         return cache[1]
 
     def _show_origami_full_review(self):
-        self.origami_plot_option.set("Why wasn’t this full?")
+        self.origami_plot_option.set("Digital bit derivation")
         self._plot_origami_full_review()
 
     def _plot_origami_full_review(self):
         if self.origami_result is None or self.origami_selected_index is None:
-            messagebox.showinfo("Select an origami", "Click a gallery thumbnail first, then choose Why wasn't this full?.")
+            messagebox.showinfo("Select an origami", "Click a gallery thumbnail first, then choose Digital bit derivation.")
             return
         saved = saved_gallery_classification(self, self.origami_result, int(self.origami_selected_index))
         if saved is None:
@@ -15332,7 +15298,7 @@ class PaintAnalysisApp(tk.Tk):
             return
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
-        self.origami_last_rendered_plot_option = "Why wasn’t this full?"
+        self.origami_last_rendered_plot_option = "Digital bit derivation"
         self.origami_detail_number.set(int(self.origami_selected_index) + 1)
         self.origami_detail_label.set(f"Origami {int(self.origami_selected_index)+1:,}/{self.origami_result.origami_count:,}")
         self._configure_origami_navigation_controls()
@@ -15345,29 +15311,7 @@ class PaintAnalysisApp(tk.Tk):
     def _plot_origami_audit(self, view: str) -> None:
         try:
             audit = self._get_origami_review()
-            if view == "180° orientation check":
-                key = self.origami_review_cache[0]
-                cache = self.__dict__.get("origami_orientation_cache")
-                if cache is None or cache[0] != key:
-                    results = dict(self.origami_multi_template_results)
-                    first = next(iter(results.values()))
-                    p = first["params"]
-                    grid = origami_grid_points(int(p["rows"]), int(p["columns"]), float(p["spacing_x_nm"]), float(p["spacing_y_nm"]), p)
-                    fiducials = alignment_template_overlay_points(np.empty((0, 2)), p)
-                    self.status.set("Comparing saved and 180° orientations at fixed thresholds…")
-                    self._run_worker(lambda: ("origami_orientation", {"key": key, "tables": compare_half_turn(results, audit, grid, fiducials)}))
-                    return
-                plot_half_turn(self.origami_figure, cache[1])
-            elif view == "ON-dropout model check":
-                cache = self.__dict__.get("origami_dropout_cache")
-                key = self.origami_review_cache[0]
-                if cache is None or cache[0] != key:
-                    results = dict(self.origami_multi_template_results)
-                    self.status.set("Fitting dropout models and checking held-out predictions…")
-                    self._run_worker(lambda: ("origami_dropout", {"key": key, "tables": fit_dropout_models(results, audit)}))
-                    return
-                plot_dropout_models(self.origami_figure, cache[1])
-            elif view == "Unclassified evidence distributions":
+            if view == "Unclassified evidence distributions":
                 plot_evidence(self.origami_figure, audit)
             elif view == "Threshold sensitivity":
                 parameter = self.origami_sweep_parameter.get()
@@ -15387,26 +15331,6 @@ class PaintAnalysisApp(tk.Tk):
         self._configure_origami_navigation_controls()
         self.notebook.select(ORIGAMI_TAB)
         self.status.set("Read-only classification audit. Export Classification Audits for per-candidate gates, spatial coordinates, and all template distances.")
-
-    def _finish_origami_orientation(self, payload):
-        self._get_origami_review()
-        if payload["key"] != self.origami_review_cache[0]:
-            return
-        self.origami_orientation_cache = (payload["key"], payload["tables"])
-        if self.origami_plot_option.get() == "180° orientation check":
-            self._plot_origami_audit("180° orientation check")
-        else:
-            self.status.set("180° orientation check is ready in View and Export Classification Audits.")
-
-    def _finish_origami_dropout(self, payload):
-        self._get_origami_review()
-        if payload["key"] != self.origami_review_cache[0]:
-            return
-        self.origami_dropout_cache = (payload["key"], payload["tables"])
-        if self.origami_plot_option.get() == "ON-dropout model check":
-            self._plot_origami_audit("ON-dropout model check")
-        else:
-            self.status.set("Dropout model check is ready in View and Export Classification Audits.")
 
     def export_origami_audits(self) -> None:
         try:
@@ -15610,236 +15534,6 @@ class PaintAnalysisApp(tk.Tk):
                 )
         else:
             self.status.set("No finite digital-group probabilities were available.")
-
-    def _plot_classification_diagnostics(self) -> None:
-        if not self.origami_multi_template_results:
-            messagebox.showinfo(
-                "No template classification",
-                "Load multiple templates and run Identify Origami before viewing diagnostics.",
-            )
-            return
-        names = list(self.origami_multi_template_results)
-        diagnostics = classification_bias_diagnostics(
-            names,
-            [int(self.origami_multi_template_counts.get(name, 0)) for name in names],
-            self.origami_multi_template_unclassified_details,
-            int(self.origami_multi_template_unclassified_count),
-        )
-        assigned = np.asarray(diagnostics["assigned"], dtype=int)
-        rejected = np.asarray(diagnostics["rejected_best"], dtype=int)
-        rates = np.asarray(diagnostics["assignment_rates"], dtype=float)
-        failures = np.asarray(diagnostics["failure_counts"], dtype=int)
-        unresolved = int(diagnostics["unresolved_unclassified"])
-        unmatched = int(diagnostics["unmatched_count"])
-        ambiguous = int(diagnostics["ambiguous_count"])
-
-        self.origami_figure.clear()
-        self.origami_figure.set_layout_engine("constrained", w_pad=10 / 72, h_pad=8 / 72)
-        dashboard = self.origami_figure.add_gridspec(
-            2,
-            2,
-            height_ratios=(1.0, 1.25),
-            width_ratios=(1.08, 0.92),
-        )
-        count_axis = self.origami_figure.add_subplot(dashboard[0, 0])
-        margin_axis = self.origami_figure.add_subplot(dashboard[0, 1])
-        failure_axis = self.origami_figure.add_subplot(dashboard[1, :])
-        positions = np.arange(len(names))
-        palette = matplotlib.colormaps["tab10"]
-        colors = [palette(index % 10) for index in range(len(names))]
-        probability_sums = np.asarray(
-            [
-                np.sum(
-                    np.asarray(
-                        self.origami_multi_template_results[name]
-                        .get("params", {})
-                        .get("classification_template_probabilities", ()),
-                        dtype=float,
-                    )
-                )
-                for name in names
-            ],
-            dtype=float,
-        )
-        assigned_bars = count_axis.barh(
-            positions,
-            assigned,
-            color=colors,
-            edgecolor="white",
-            label="Assigned",
-        )
-        rejected_bars = count_axis.barh(
-            positions,
-            rejected,
-            left=assigned,
-            color="#d1d5db",
-            edgecolor="#6b7280",
-            hatch="///",
-            label="Best fit, rejected",
-        )
-        count_axis.scatter(
-            probability_sums,
-            positions,
-            marker="D",
-            s=42,
-            facecolors="white",
-            edgecolors="black",
-            linewidths=1.1,
-            zorder=5,
-            label="Σ raw model probability",
-        )
-        for position, probability_sum in zip(positions, probability_sums):
-            count_axis.annotate(
-                f"Σp {probability_sum:.1f}",
-                (probability_sum, position),
-                xytext=(5, 0),
-                textcoords="offset points",
-                ha="left",
-                va="center",
-                fontsize=7,
-                fontweight="bold",
-            )
-        count_axis.bar_label(
-            assigned_bars,
-            labels=[f"{value:,}" if value else "" for value in assigned],
-            label_type="center",
-            color="white",
-            fontsize=8,
-            fontweight="bold",
-        )
-        for bar, value, rate in zip(rejected_bars, rejected, rates):
-            if value:
-                count_axis.text(
-                    bar.get_x() + bar.get_width() / 2.0,
-                    bar.get_y() + bar.get_height() / 2.0,
-                    f"rej {value:,}",
-                    ha="center",
-                    va="center",
-                    fontsize=7,
-                )
-            count_axis.annotate(
-                f"{100.0 * rate:.0f}% pass",
-                (bar.get_x() + bar.get_width(), bar.get_y() + bar.get_height() / 2.0),
-                xytext=(4, 0),
-                textcoords="offset points",
-                ha="left",
-                va="center",
-                fontsize=7,
-                color="#374151",
-            )
-        count_axis.set_yticks(positions, labels=names)
-        count_axis.invert_yaxis()
-        count_axis.set_xlabel("candidate equivalents")
-        count_axis.set_title("Assignments and pre-gate model preference", fontsize=10)
-        count_axis.legend(loc="lower right", fontsize=7, framealpha=0.9)
-        count_axis.grid(True, axis="x", alpha=0.22)
-
-        margin_values: list[np.ndarray] = []
-        for name in names:
-            payload = self.origami_multi_template_results[name]
-            picks = payload.get("picks")
-            params = dict(payload.get("params", {}))
-            margins = np.asarray(params.get("classification_winner_margins", ()), dtype=float)
-            accepted_mask = (
-                np.asarray(picks.accepted_mask, dtype=bool)
-                if picks is not None
-                else np.zeros(len(margins), dtype=bool)
-            )
-            if len(margins) != len(accepted_mask):
-                margin_values.append(np.empty(0, dtype=float))
-            else:
-                margin_values.append(margins[accepted_mask & np.isfinite(margins)])
-        plotted_margins = [values if len(values) else np.asarray([np.nan]) for values in margin_values]
-        boxes = margin_axis.boxplot(
-            plotted_margins,
-            positions=positions,
-            widths=0.55,
-            vert=False,
-            patch_artist=True,
-            showfliers=True,
-            medianprops={"color": "black", "linewidth": 1.2},
-        )
-        for index, box in enumerate(boxes["boxes"]):
-            box.set_facecolor(colors[index])
-            box.set_alpha(0.7)
-        margin_axis.axvline(0.0, color="#b91c1c", linestyle="--", linewidth=1.0)
-        margin_axis.set_yticks(positions, labels=names)
-        margin_axis.invert_yaxis()
-        margin_axis.set_xlabel("winner − runner-up evidence")
-        margin_axis.set_title("Assignment certainty (near 0 = ambiguous)", fontsize=10)
-        margin_axis.grid(True, axis="x", alpha=0.22)
-
-        rejection_denominator = np.maximum(rejected[:, None], 1)
-        failure_percent = 100.0 * failures / rejection_denominator
-        image = failure_axis.imshow(
-            failure_percent.T,
-            origin="upper",
-            cmap="magma",
-            vmin=0.0,
-            vmax=max(1.0, float(np.max(failure_percent))),
-            aspect="auto",
-        )
-        failure_axis.set_xticks(positions, labels=names)
-        failure_axis.tick_params(
-            axis="x",
-            top=True,
-            labeltop=True,
-            bottom=False,
-            labelbottom=False,
-            pad=3,
-        )
-        failure_axis.set_yticks(
-            np.arange(len(CLASSIFICATION_DIAGNOSTIC_GATES)),
-            labels=CLASSIFICATION_DIAGNOSTIC_GATES,
-        )
-        failure_axis.set_title("Why best-fit candidates were rejected (count · %)", fontsize=10, pad=8)
-        failure_axis.set_xlabel("A candidate may fail multiple gates.", fontsize=8)
-        for template_index in range(len(names)):
-            for gate_index in range(len(CLASSIFICATION_DIAGNOSTIC_GATES)):
-                count = int(failures[template_index, gate_index])
-                if count:
-                    failure_axis.text(
-                        template_index,
-                        gate_index,
-                        f"{count} · {failure_percent[template_index, gate_index]:.0f}%",
-                        ha="center",
-                        va="center",
-                        fontsize=8,
-                        color="white" if failure_percent[template_index, gate_index] < 55 else "black",
-                    )
-        self.origami_figure.colorbar(
-            image,
-            ax=failure_axis,
-            label="rejected best fits (%)",
-            pad=0.015,
-            shrink=0.92,
-        )
-        self.origami_figure.suptitle(
-            f"Classification diagnostics: {int(np.sum(assigned)):,} assigned · "
-            f"{int(np.sum(rejected)):,} rejected with unique best template\n"
-            f"{unmatched:,} no matching template · {ambiguous:,} tied/ambiguous"
-            f"{f'; {unresolved:,} without a recorded best-template diagnosis' if unresolved else ''}",
-            fontsize=12,
-        )
-        self.origami_canvas.draw_idle()
-        self.origami_toolbar.update()
-        self.origami_last_rendered_plot_option = "Classification diagnostics"
-        self._configure_origami_navigation_controls()
-        self.notebook.select(ORIGAMI_TAB)
-        lowest_index = int(np.argmin(rates)) if len(rates) else 0
-        highest_probability_index = int(np.argmax(probability_sums)) if len(probability_sums) else 0
-        total_probability = float(np.sum(probability_sums))
-        probability_share = (
-            100.0 * probability_sums[highest_probability_index] / total_probability
-            if total_probability > 0.0
-            else 0.0
-        )
-        self.status.set(
-            f"Classification diagnostics: lowest best-template pass rate is "
-            f"{names[lowest_index]} at {100.0 * rates[lowest_index]:.1f}%. "
-            f"Largest summed raw model probability is {names[highest_probability_index]} "
-            f"({probability_share:.1f}% of total probability mass)."
-        )
 
     def _plot_origami_site_heatmap(
         self,
@@ -17110,6 +16804,12 @@ class PaintAnalysisApp(tk.Tk):
             variable = self.__dict__.get(key)
             if isinstance(variable, tk.Variable) and (key.startswith("origami_") or key in ANALYSIS_GLOBAL_SETTINGS) and key not in {"origami_fullscreen_plot", "origami_sidebar_visible"}:
                 variable.set(value)
+        if self.origami_plot_option.get() in {"Why wasn’t this full?", "Why wasn't this full?"}:
+            self.origami_plot_option.set("Digital bit derivation")
+        if self.origami_plot_option.get() == "Occupied-site completeness":
+            self.origami_plot_option.set("Site occupancy")
+        if self.origami_plot_option.get() in {"Classification diagnostics", "180° orientation check", "ON-dropout model check"}:
+            self.origami_plot_option.set("Origami type counts")
         self.hist_filter_enabled = {key: tk.BooleanVar(value=bool(value))
                                     for key, value in payload.get("filter_enabled", {}).items()}
         self._refresh_filter_list()
@@ -17166,9 +16866,9 @@ class PaintAnalysisApp(tk.Tk):
                 self.origami_result_source_count = int(cached["source_count"])
                 self.origami_result_occupancy_threshold = int(cached["occupancy_threshold"])
             global_views = {"Coarse identification density", "Identified origami template matches",
-                            "Origami type counts", "Classification diagnostics", "Digital-group bias heatmap",
+                            "Origami type counts", "Digital-group bias heatmap",
                             "Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions",
-                            "Threshold sensitivity", "ON-dropout model check", "180° orientation check", "Digital-pixel spatial heatmap"}
+                            "Threshold sensitivity", "Digital-pixel spatial heatmap"}
             if selected == "All templates" and self.origami_plot_option.get() not in global_views:
                 self.origami_plot_option.set("Origami type counts")
             if payload.get("diagnostics"):
@@ -17178,7 +16878,7 @@ class PaintAnalysisApp(tk.Tk):
                         self.__dict__[name] = (self.origami_review_cache[0], *payload["diagnostics"][name])
         elif self.origami_result is None and self.origami_pick_result is not None:
             self.origami_plot_option.set("Identified origami template matches")
-        if self.origami_plot_option.get() in {"Selected origami detail", "Why wasn’t this full?"} and self.origami_selected_index is None:
+        if self.origami_plot_option.get() in {"Selected origami detail", "Digital bit derivation"} and self.origami_selected_index is None:
             self.origami_plot_option.set("Individual origami gallery")
         self._show_origami_stage("Identify")
         self._finish_origami_identification_progress("Loaded saved analysis; no reanalysis required.")

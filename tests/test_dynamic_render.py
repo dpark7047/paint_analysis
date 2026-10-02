@@ -1580,31 +1580,6 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual(int(diagnostics["failure_counts"][1, 4]), 1)
         self.assertEqual(diagnostics["unresolved_unclassified"], 1)
 
-    def test_classification_diagnostics_plot_uses_recorded_best_template_failures(self) -> None:
-        figure = Figure()
-        app = SimpleNamespace(
-            origami_multi_template_results={"type_a": {}, "type_b": {}},
-            origami_multi_template_counts={"type_a": 8, "type_b": 4},
-            origami_multi_template_unclassified_count=3,
-            origami_multi_template_unclassified_details=[
-                {"template_name": "type_a", "failure_reasons": ("corr 0.2 < 0.4",)},
-                {"template_name": "type_a", "failure_reasons": ("points 20 < 500",)},
-                {"template_name": "type_b", "failure_reasons": ("sites 3 < 5",)},
-            ],
-            origami_figure=figure,
-            origami_canvas=SimpleNamespace(draw_idle=mock.Mock()),
-            origami_toolbar=SimpleNamespace(update=mock.Mock()),
-            _configure_origami_navigation_controls=mock.Mock(),
-            notebook=SimpleNamespace(select=mock.Mock()),
-            status=FakeVariable(""),
-        )
-
-        PaintAnalysisApp._plot_classification_diagnostics(app)
-
-        self.assertEqual(len(figure.axes), 4)  # counts, margins, failure heatmap, colorbar
-        self.assertEqual([patch.get_width() for patch in figure.axes[0].patches], [8, 4, 2, 1])
-        self.assertIn("lowest best-template pass rate", app.status.get())
-
     def test_selecting_a_classified_type_restores_its_fits_and_cached_overlay(self) -> None:
         picks = object()
         result = object()
@@ -1730,14 +1705,11 @@ class DynamicRenderTests(unittest.TestCase):
                 "Coarse identification density",
                 "Identified origami template matches",
                 "Origami type counts",
-                "Classification diagnostics",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
             ),
@@ -1752,14 +1724,11 @@ class DynamicRenderTests(unittest.TestCase):
             values=(
                 "Identified origami template matches",
                 "Origami type counts",
-                "Classification diagnostics",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap",
             )
         )
@@ -1773,11 +1742,9 @@ class DynamicRenderTests(unittest.TestCase):
             origami_template_result_view=SimpleNamespace(get=lambda: "full_align"),
             origami_result=None,
             origami_all_plot_options=("Coarse identification density", "Identified origami template matches",
-                "Origami type counts", "Classification diagnostics", "Digital-group bias heatmap", "Digital-group threshold audit", "Unmatched-pattern audit",
+                "Origami type counts", "Digital-group bias heatmap", "Digital-group threshold audit", "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap", "Individual origami gallery", "Aligned density"),
             origami_plot_combo=combo,
         )
@@ -1944,14 +1911,11 @@ class DynamicRenderTests(unittest.TestCase):
                 "Coarse identification density",
                 "Identified origami template matches",
                 "Origami type counts",
-                "Classification diagnostics",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
                 "Aligned density",
@@ -1968,14 +1932,11 @@ class DynamicRenderTests(unittest.TestCase):
                 "Coarse identification density",
                 "Identified origami template matches",
                 "Origami type counts",
-                "Classification diagnostics",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
                 "Unclassified evidence distributions",
                 "Threshold sensitivity",
-                "ON-dropout model check",
-                "180° orientation check",
                 "Digital-pixel spatial heatmap",
                 "Individual origami gallery",
                 "Aligned density",
@@ -2445,7 +2406,6 @@ class DynamicRenderTests(unittest.TestCase):
         expected_modes = {
             "Loaded source data": "none",
             "Origami type counts": "none",
-            "Classification diagnostics": "none",
             "Coarse identification density": "roi",
             "Random ROI inspection": "roi",
             "Identified origami template matches": "roi",
@@ -2457,7 +2417,6 @@ class DynamicRenderTests(unittest.TestCase):
             "Integrated density per site": "none",
             "Mean site counts": "none",
             "Site occupancy": "none",
-            "Occupied-site completeness": "none",
         }
 
         for view, expected_mode in expected_modes.items():

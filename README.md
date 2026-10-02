@@ -110,8 +110,7 @@ Load it in a later session to restore classifications, aligned particles,
 digital-pixel measurements, excluded/unclassified results, and any overlays
 already built. The selected classification, plot view, gallery page, and selected
 particle are restored when available. Use the Classification and View controls
-to inspect other saved results. Completed orientation/dropout diagnostics and
-threshold-sweep tables are preserved; older saves can regenerate these diagnostics
+to inspect other saved results. Completed threshold-sweep tables are preserved; older saves can regenerate them
 from saved measurements without repeating detection or classification.
 
 The archive embeds localization tables, detection/classification template images,
@@ -600,7 +599,7 @@ the overview and can be toggled without rerunning identification.
    density`, and `Connect` directly visible. The other choices include the cached identification with a dynamically rerendered template-match density preview,
    preview, paged individual aligned origamis, per-origami site assignments,
    a selected-origami detail view, aligned density, integrated density per site, mean site counts,
-   site occupancy, or occupied-site completeness. `Integrated density per site`
+   or site occupancy. `Integrated density per site`
    sums the displayed, blurred aligned-density pixels within `Site radius` of
    every expected position. It includes unmatched source points and provides a
    direct diagnostic for distinguishing spatial broadening from G5M assignment
@@ -823,12 +822,6 @@ use only fully fitting tiles. Older default-named ROI exports use the same
 inferred bounds as their initial map view. Empty tiles inside the saved region
 can still occur and are skipped.
 
-Classification diagnostics attribute a rejected candidate to a template only
-when that template has a unique, finite best score. Candidates with no matching
-template and tied/ambiguous candidates are counted separately above the plots;
-they do not enter template-specific rejection bars or pass rates. Older recorded
-no-match diagnoses are also excluded from the last template's rejection count.
-
 ### Classification QC audits
 
 After Step 4, choose **Digital-group threshold audit** or **Unmatched-pattern
@@ -896,7 +889,7 @@ invalid measurements, and near-full candidates with one or two groups OFF.
 These filters only change the displayed subset. Thumbnail captions include the
 saved candidate ID and a short disposition; text statistics adds the full reason.
 
-Click a thumbnail, then **Why wasn't this full?** to see the original aligned
+Click a thumbnail, then **Digital bit derivation** to see the original aligned
 localizations, site measurement regions, saved group calls, support/score/prominence
 values alongside their thresholds, groups missing from a full match, and other
 failed QC gates. It does not reinterpret a nearest template as the true type.
@@ -925,76 +918,6 @@ and `threshold_counts.csv`. Join the transition table to `candidates.csv` by
 `candidate_id` to locate individual changed candidates. Recoveries are proposed
 assignments, not verified correct classifications; mixture ratios are not used
 to optimize the sweep.
-
-### Is full underrepresented because it needs more ON groups?
-
-Choose **ON-dropout model check** in View after digital classification. The model
-fits all valid saved ON/OFF patterns, including unclassified candidates, without
-using assigned class labels as truth. It uses the input mixture (code3 twice the
-weight of the other templates) and compares:
-
-1. One ON-detection rate and one false-ON rate shared across groups/templates.
-2. Group-specific ON-detection and false-ON rates shared across template types.
-3. The group model plus an additional loss of ON signal for variable groups in
-   the full template. The common alignment group is unaffected by this extra term.
-
-ON-detection probabilities are constrained to be at least false-ON probabilities.
-An always-ON group has no identifiable false-ON rate, so that estimate is omitted.
-The extra-full parameter retains a fraction of the difference between ON detection
-and false-ON, rather than measuring physical full-origami yield.
-
-The check compares model complexity using BIC (lower is better), and predictive
-log scores using three deterministic held-out folds (higher is better). Error
-bars on score differences are twice an approximate paired standard error, not a
-formal significance test. Inspect both comparisons and pattern residuals; an
-extra-full term improving in-sample fit alone is insufficient evidence for a
-full-specific effect. Small datasets, boundary fits, and correlated errors can
-make estimates uncertain.
-
-The count plot compares exact patterns **before final QC rejection**, not final
-assignments. The three largest pattern discrepancies under the group model are
-shown, and all pattern residuals are exported. Fitting runs in a worker and is
-cached for the current result set. After it finishes, **Export Classification
-Audits** includes model statistics, group error estimates, pattern counts,
-all binary-pattern residuals, and per-candidate held-out scores.
-
-This is an exploratory model comparison. It assumes independent group calls
-conditional on the unknown true template and that the known input mixture also
-describes the detected candidates. It does not model preferential detection,
-damaged/background objects, or correlated signal loss. Those processes could
-look like an extra full effect. Model rates are inferred, not independently
-measured error rates, and no assignments are changed. At least 30 valid candidates
-(and three per group), distinct template patterns, one all-ON template, and no
-more than 12 groups are required.
-
-### Checking a possible 180° alignment error
-
-Choose **180° orientation check** in View after classification. It compares the
-saved aligned localizations with an exact half-turn about the saved origin,
-without translating, recropping, refitting, or changing any assignment. Both
-orientations use the saved group thresholds. The original orientation must
-reproduce the saved calls before the comparison is accepted.
-
-The plot compares paired alignment-raster correlations, supported fiducial counts,
-ON-group gains, and alternative exact template matches. It lists saved candidate
-IDs worth inspecting. A new match is stronger evidence when both fiducial support
-and paired correlation improve; trying an extra orientation can otherwise create
-chance matches. Invalid saved candidates are excluded from summary counts.
-
-The paired correlations use **cropped saved localizations**, so they are not the
-original search scores (which had more context). The original score is exported
-separately. Original QC eligibility and duplicate/tile exclusions stay fixed;
-unknown QC eligibility is not a pass. A newly matching pattern still requires
-proper alignment/QC validation before it could be reassigned. Corner-support
-results for both orientations are exported independently of whether that gate
-was enabled.
-
-After the worker finishes, **Export Classification Audits** includes
-`orientation_candidates.csv`, `orientation_groups.csv`, and
-`orientation_fiducials.csv`, with original IDs, both patterns, gained/lost groups,
-paired scores, and support counts. The comparison requires the saved alignment
-raster and fiducial geometry. This is a test of an exact half-turn, not a search
-for a better translated or otherwise adjusted pose.
 
 ### Picklist template image orientation
 

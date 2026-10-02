@@ -93,19 +93,17 @@ def populate(a):
     def work(fn):
         kind,payload=fn()
         if kind=='origami': a._plot_origami_analysis(payload)
-        elif kind=='origami_orientation': a._finish_origami_orientation(payload)
-        elif kind=='origami_dropout': a._finish_origami_dropout(payload)
         else: raise ValueError(kind)
     a._run_worker=work
     return a
 
 VIEWS = ['Coarse identification density', 'Identified origami template matches',
-    'Origami type counts', 'Classification diagnostics', 'Digital-group bias heatmap',
+    'Origami type counts', 'Digital-group bias heatmap',
     'Digital-group threshold audit', 'Unmatched-pattern audit', 'Unclassified evidence distributions',
-    'Threshold sensitivity', 'ON-dropout model check', '180° orientation check',
+    'Threshold sensitivity',
     'Digital-pixel spatial heatmap', 'Individual origami gallery', 'Individual site assignments',
-    'Selected origami detail', 'Why wasn’t this full?', 'Aligned density',
-    'Integrated density per site', 'Mean site counts', 'Site occupancy', 'Occupied-site completeness']
+    'Selected origami detail', 'Digital bit derivation', 'Aligned density',
+    'Integrated density per site', 'Mean site counts', 'Site occupancy']
 
 
 def snapshot(a):
@@ -130,10 +128,10 @@ def matrix(a, monkeypatch):
         a.origami_template_result_view.set(name)
         a.origami_plot_option.set('Origami type counts')
         a._on_origami_template_result_selection()
-        for view in (VIEWS[:12] if name == 'All templates' else VIEWS):
+        for view in (VIEWS[:9] if name == 'All templates' else VIEWS):
             notices.clear()
             a.origami_plot_option.set(view)
-            if view in ('Selected origami detail', 'Why wasn’t this full?'):
+            if view in ('Selected origami detail', 'Digital bit derivation'):
                 a.origami_selected_index = 0
             a.render_origami_plot()
             a.origami_canvas.draw()
@@ -154,7 +152,7 @@ def test_all_classification_views_match_after_archive_round_trip(tmp_path, monke
     saved_class = live.origami_template_result_view.get()
     saved_view = live.origami_plot_option.get()
     payload = live._capture_origami_analysis()
-    assert set(payload['diagnostics']) == {'origami_orientation_cache', 'origami_dropout_cache', 'origami_latest_sweep'}
+    assert set(payload['diagnostics']) == {'origami_latest_sweep'}
     path = tmp_path / 'views.paintanalysis'
     save_analysis_session(path, payload)
     restored = app()

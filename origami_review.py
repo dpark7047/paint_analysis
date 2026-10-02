@@ -225,5 +225,5 @@ def plot_full_detail(figure, results, audit, candidate_id, *, grid_points=None, 
     candidate = audit['candidates'].iloc[index]
     import textwrap
     right.set_title('\n'.join(textwrap.wrap(' | '.join(text), 80)), fontsize=10)
-    figure.suptitle(f"Why wasn't this full? Saved candidate #{candidate_id}\n" + '\n'.join(textwrap.wrap(candidate.rejection_reason, 120)), fontsize=10)
+    figure.suptitle(f"Digital bit derivation Saved candidate #{candidate_id}\n" + '\n'.join(textwrap.wrap(candidate.rejection_reason, 120)), fontsize=10)
     figure.tight_layout(rect=(0, 0, 1, .9))
