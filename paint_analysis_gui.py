@@ -11,6 +11,7 @@ import threading
 import tempfile
 import traceback
 import gc
+import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,6 +38,7 @@ from matplotlib.path import Path as MatplotlibPath
 from matplotlib.widgets import RectangleSelector
 
 from analysis_session import save_analysis_session, load_analysis_session
+from tile_checkpoint import TileCheckpoint, checkpoint_lock, load_checkpoint_run
 
 from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
                            plot_evidence, plot_sweep, plot_full_detail)
@@ -2313,6 +2315,35 @@ def read_drift_csv(path: Path, frame_count: int, pixel_size_nm: float) -> pd.Dat
     return drift
 
 
+def export_drift_csv(drift: pd.DataFrame, destination: Path, frame_count: int, pixel_size_nm: float) -> int:
+    """Save the applied per-frame displacement in nanometers, without rebasing it."""
+    table = pd.DataFrame(drift).copy()
+    if table.empty or not {"x", "y"}.issubset(table.columns):
+        raise ValueError("No x/y drift trace is available. Run drift correction first.")
+    if not np.isfinite(pixel_size_nm) or pixel_size_nm <= 0:
+        raise ValueError("Pixel size must be a positive finite number.")
+    frames = table["frame"].to_numpy() if "frame" in table else table.index.to_numpy()
+    output = pd.DataFrame({"Frame": frames})
+    for axis in ("x", "y", "z"):
+        if axis in table:
+            output[f"{axis}-drift (nm)"] = pd.to_numeric(table[axis], errors="raise").to_numpy(dtype=float) * pixel_size_nm
+    destination = Path(destination)
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", dir=destination.parent,
+                                         encoding="utf-8", newline="", delete=False) as handle:
+            temporary_path = Path(handle.name)
+            output.to_csv(handle, index=False)
+        # Use the importer itself to verify finite values and complete frame coverage
+        # before atomically replacing an existing export.
+        read_drift_csv(temporary_path, frame_count, pixel_size_nm)
+        os.replace(temporary_path, destination)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+    return len(output)
+
+
 def apply_drift_file(
     locs: pd.DataFrame,
     info: list[dict[str, Any]],
@@ -3737,6 +3768,8 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_show_detected_sites_overlay = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_DETECTED_SITES_OVERLAY
         )
+        self.origami_show_legends = tk.BooleanVar(value=True)
+        self.origami_checkpoint_location = tk.StringVar(value="No checkpoint folder selected")
         self.origami_show_corner_diagnostics = tk.BooleanVar(value=False)
         self.origami_show_site_diagnostics = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_SITE_DIAGNOSTICS
@@ -3954,6 +3987,7 @@ class PaintAnalysisApp(tk.Tk):
         ttk.Button(roi_box, text="Clear ROI", command=self.clear_roi).grid(row=1, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(roi_box, text="Save Raw ROI CSV", command=lambda: self.export_roi_csv(False)).grid(row=2, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(roi_box, text="Save Corrected ROI CSV", command=lambda: self.export_roi_csv(True)).grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(roi_box, text="Select Whole Image", command=self.select_whole_image_roi).grid(row=4, column=0, sticky="ew", pady=(8, 0))
 
         drift_box = ttk.LabelFrame(sidebar, text="Drift Correction", padding=10)
         drift_box.grid(row=4, column=0, sticky="ew", pady=(0, 10))
@@ -3968,6 +4002,7 @@ class PaintAnalysisApp(tk.Tk):
         ttk.Button(drift_box, text="Load Drift CSV", command=self.load_drift_file).grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Label(drift_box, textvariable=self.drift_file_label, wraplength=250).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(drift_box, text="Apply Drift Correction", command=self.apply_correction).grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Button(drift_box, text="Save Drift CSV…", command=self.save_drift_file).grid(row=9, column=0, columnspan=2, sticky="ew", pady=(6, 0))
 
         render_box = ttk.LabelFrame(sidebar, text="Render Settings", padding=10)
         render_box.grid(row=5, column=0, sticky="ew", pady=(0, 10))
@@ -4367,7 +4402,7 @@ class PaintAnalysisApp(tk.Tk):
         origami_tab = ttk.Frame(self.notebook)
         origami_tab.columnconfigure(0, weight=1)
         origami_tab.rowconfigure(0, weight=1)
-        self.notebook.add(origami_tab, text="Origami")
+        self.notebook.add(origami_tab, text="Classification")
         self.origami_tab = origami_tab
 
         self.origami_workspace = ttk.Frame(origami_tab)
@@ -4890,6 +4925,10 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_tiled_button.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         self.origami_tiled_button.state(["disabled"])
         WidgetTooltip(self.origami_tiled_button, "Analyze the full image on the validation ROI lattice, including clipped partial tiles along every edge.")
+        ttk.Button(tile_box, text="Resume Tiled Analysis…", command=self.resume_tiled_analysis).grid(
+            row=7, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Label(tile_box, textvariable=self.origami_checkpoint_location, wraplength=320).grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         step_progress(tile_box, 4, 5)
         ttk.Label(
             tile_box,
@@ -5050,6 +5089,7 @@ class PaintAnalysisApp(tk.Tk):
             "Coarse identification density",
             "Identified origami template matches",
             "Origami type counts",
+            "Open vs closed",
             "Digital-group bias heatmap",
             "Digital-group threshold audit",
             "Unmatched-pattern audit",
@@ -5173,6 +5213,12 @@ class PaintAnalysisApp(tk.Tk):
                 "Show selected peaks, sampling boundaries, and prominence reference positions.",
             ),
             (
+                "Show legends",
+                self.origami_show_legends,
+                self._toggle_origami_legends,
+                "Show or hide plot legends in the Classification tab, including every aligned-density panel. Color scales remain visible.",
+            ),
+            (
                 "Show text statistics",
                 self.origami_show_text_statistics,
                 self._toggle_origami_text_statistics,
@@ -5196,9 +5242,10 @@ class PaintAnalysisApp(tk.Tk):
             )
             WidgetTooltip(control, help_text)
             qc_display_controls.append(control)
-        ttk.Button(self.origami_qc_display_bar, text="Type-count x-axis order…",
-                   command=self._edit_origami_type_count_order).grid(
-                       row=4, column=0, sticky="w", pady=(5, 2))
+        self.origami_type_order_button = ttk.Button(
+            self.origami_qc_display_bar, text="Type-count x-axis order…",
+            command=self._edit_origami_type_count_order)
+        self.origami_type_order_button.grid(row=4, column=0, sticky="w", pady=(5, 2))
         self.origami_qc_display_controls = tuple(qc_display_controls)
         for column in range(3):
             self.origami_qc_display_bar.columnconfigure(column, weight=1)
@@ -5379,6 +5426,7 @@ class PaintAnalysisApp(tk.Tk):
         if hasattr(self, "origami_plot_combo"):
             classification_diagnostic_options = (
                 "Origami type counts",
+                "Open vs closed",
                 "Digital-group bias heatmap",
                 "Digital-group threshold audit",
                 "Unmatched-pattern audit",
@@ -5401,6 +5449,10 @@ class PaintAnalysisApp(tk.Tk):
                         *classification_diagnostic_options,
                     )
                 )
+            if (self.origami_multi_template_results
+                    and self.__dict__.get("origami_template_result_view") is not None
+                    and self.origami_template_result_view.get() == "All templates"):
+                identification_options = (*identification_options, "Aligned density")
             identification_names = {
                 "Coarse identification density",
                 "Identified origami template matches",
@@ -5415,7 +5467,7 @@ class PaintAnalysisApp(tk.Tk):
                 if self.origami_result is not None or selected_classification_has_assignments(self)
                 else ()
             )
-            available_options = (*identification_options, *overlay_options)
+            available_options = tuple(dict.fromkeys((*identification_options, *overlay_options)))
             self.origami_plot_combo.configure(values=available_options)
             self.origami_plot_combo.state(["!disabled", "readonly"] if available_options else ["disabled"])
 
@@ -5468,6 +5520,22 @@ class PaintAnalysisApp(tk.Tk):
             DEFAULT_ORIGAMI_SHOW_PROMINENCE_GEOMETRY
         )
         self.origami_show_text_statistics.set(DEFAULT_ORIGAMI_SHOW_TEXT_STATISTICS)
+
+    def _apply_origami_legend_visibility(self) -> None:
+        toggle = self.__dict__.get("origami_show_legends")
+        if toggle is None:
+            return
+        visible = bool(toggle.get())
+        for axis in self.origami_figure.axes:
+            legend = axis.get_legend()
+            if legend is not None:
+                legend.set_visible(visible)
+        for legend in self.origami_figure.legends:
+            legend.set_visible(visible)
+
+    def _toggle_origami_legends(self) -> None:
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
+        self.origami_canvas.draw_idle()
 
     def _toggle_origami_theoretical_overlay(self) -> None:
         if self.origami_last_rendered_plot_option in {"Individual origami gallery", "Individual site assignments", "Aligned density"}:
@@ -5744,6 +5812,9 @@ class PaintAnalysisApp(tk.Tk):
                     padx=(0, 12),
                     pady=1,
                 )
+            order_button = getattr(self, "origami_type_order_button", None)
+            if order_button is not None:
+                order_button.grid_configure(row=1 + math.ceil(len(qc_controls) / column_count))
 
     def _toggle_origami_fullscreen_plot(self) -> None:
         if self.origami_fullscreen_plot.get():
@@ -6003,6 +6074,10 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_result = None
             if requested_view == "Origami type counts":
                 self._plot_origami_type_counts()
+            elif requested_view == "Aligned density" and name == "All templates":
+                self.render_origami_plot()
+            elif requested_view == "Open vs closed":
+                self._plot_open_vs_closed()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
             elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity"):
@@ -6041,6 +6116,8 @@ class PaintAnalysisApp(tk.Tk):
                 self._plot_origami_coarse_density()
             elif requested_view == "Origami type counts":
                 self._plot_origami_type_counts()
+            elif requested_view == "Open vs closed":
+                self._plot_open_vs_closed()
             elif requested_view == "Digital-pixel spatial heatmap":
                 self._plot_digital_pixel_spatial_heatmap()
             elif requested_view in ("Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions", "Threshold sensitivity"):
@@ -7102,6 +7179,34 @@ class PaintAnalysisApp(tk.Tk):
         self.drift_method.set("file")
         self.status.set(f"Selected drift correction file {self.drift_file_path.name}. Click Apply Drift Correction.")
 
+    def save_drift_file(self) -> None:
+        if self.loaded is None or self.drift is None:
+            messagebox.showinfo("No drift correction", "Apply RCC, AIM, or a drift file before saving a drift CSV.")
+            return
+        if self.__dict__.get("active_worker_count", 0) or self.__dict__.get("session_load_in_progress", False):
+            messagebox.showinfo("Analysis busy", "Wait for the current operation to finish before saving drift.")
+            return
+        path_text = filedialog.asksaveasfilename(
+            title="Save frame-by-frame drift correction", defaultextension=".csv",
+            initialdir=str(self.loaded.path.parent), initialfile=f"{self.loaded.path.stem}_drift.csv",
+            filetypes=[("Drift CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if not path_text:
+            return
+        destination = Path(path_text)
+        if (destination.resolve() == self.loaded.path.resolve()
+                or (destination.exists() and self.loaded.path.exists() and destination.samefile(self.loaded.path))):
+            messagebox.showerror("Choose another filename", "The drift CSV cannot overwrite the localization source file.")
+            return
+        trace = self.drift.copy()
+        frame_count = int(self.loaded.info[0]["Frames"])
+        pixel_size_nm = float(self.loaded.info[0]["Pixelsize"])
+        def worker():
+            count = export_drift_csv(trace, destination, frame_count, pixel_size_nm)
+            return "drift_csv_export", f"Saved drift for {count:,} frames in nanometers to {destination}"
+        self.status.set("Saving drift CSV…")
+        self._run_worker(worker)
+
     def apply_correction(self) -> None:
         if self.loaded is None:
             messagebox.showinfo("No file", "Load a localization CSV or Picasso HDF5 file first.")
@@ -7184,6 +7289,15 @@ class PaintAnalysisApp(tk.Tk):
             self.status.set("Rendering raw uncorrected map...")
         self._clear_raw_map_before_render()
         self._run_worker(lambda: self._render_raw_worker(render_px_nm))
+
+    def select_whole_image_roi(self) -> None:
+        bounds = self._full_map_viewport_nm()
+        if bounds is None:
+            messagebox.showinfo("No localization file", "Load a localization file before selecting the whole image.")
+            return
+        x0, x1, y0, y1 = bounds
+        self._on_roi_select(SimpleNamespace(xdata=x0, ydata=y0), SimpleNamespace(xdata=x1, ydata=y1))
+        self.status.set("Whole image selected as ROI.")
 
     def clear_roi(self) -> None:
         self.roi_nm = None
@@ -9382,11 +9496,65 @@ class PaintAnalysisApp(tk.Tk):
             "identification_params": dict(identification_params),
         }
 
+    def _choose_tile_checkpoint_destination(self):
+        parent = filedialog.askdirectory(title="Choose tiled-analysis checkpoint destination (external drive supported)",
+                                         initialdir=str(self._file_dialog_initial_dir()), mustexist=True)
+        if not parent:
+            return None
+        directory = Path(tempfile.mkdtemp(prefix="paint-tiles-", dir=parent))
+        self.origami_checkpoint_location.set(str(directory))
+        self._remember_file_dialog_dir(directory)
+        return directory
+
+    def _checkpointed_tiled_worker(self, directory, run, *, initialize=False):
+        with checkpoint_lock(directory):
+            if initialize:
+                self._worker_status(f"Saving source data and analysis settings for recovery to {directory}…")
+                save_analysis_session(Path(directory) / "run.paintanalysis", run)
+            checkpoint = TileCheckpoint(directory, run["run_id"], self._analysis_record_types(), self._worker_status)
+            return self._tiled_origami_worker(**run["context"], checkpoint=checkpoint)
+
+    def resume_tiled_analysis(self):
+        if (self.__dict__.get("active_worker_count", 0) or self.__dict__.get("analysis_io_busy", False)
+                or self.__dict__.get("origami_identification_running", False)):
+            messagebox.showinfo("Analysis busy", "Wait for the current operation before resuming tiled analysis.")
+            return
+        directory = filedialog.askdirectory(title="Select a paint-tiles recovery folder",
+                                            initialdir=str(self._file_dialog_initial_dir()), mustexist=True)
+        if not directory:
+            return
+        records = self._analysis_record_types()
+        self.status.set("Loading tiled-analysis checkpoint…")
+        self._run_worker(lambda: ("tiled_resume", (Path(directory), load_checkpoint_run(directory, records))))
+
+    def _resume_tiled_checkpoint(self, directory, run):
+        # Restore the embedded source and templates rather than mixing saved tiles
+        # with whatever dataset/settings happen to be open in the current app.
+        snapshot = run["analysis"]
+        snapshot["settings"]["origami_plot_option"] = "Identified origami template matches"
+        self._install_origami_analysis(snapshot)
+        self.origami_checkpoint_location.set(str(directory))
+        run["context"]["identification_params"]["identification_generation"] = self.origami_identification_generation
+        self.origami_identification_running = True
+        self.origami_active_step = 5
+        self._set_origami_step_progress(5, 0.0, "Resuming saved tiles…")
+        self.origami_identification_progress.set(0.0)
+        self.origami_identification_progress_text.set(f"Resuming checkpoints in {directory}")
+        for button in (self.origami_identify_button, self.origami_tiled_button,
+                       self.origami_n_tiles_button, self.origami_random_roi_button):
+            button.state(["disabled"])
+        self._refresh_origami_action_states()
+        self._remember_file_dialog_dir(directory)
+        self._run_worker(lambda: self._checkpointed_tiled_worker(directory, run))
+
     def analyze_tiled_origamis(self, *, use_tile_limit: bool = False) -> None:
         context = self._validated_origami_tile_context() if use_tile_limit else self._validated_origami_tile_context(include_partial_edges=True)
         if context is None:
             return
         source_locs, pixelsize, tile_lattice, validated_params, source_params = context
+        destination = self._choose_tile_checkpoint_destination()
+        if destination is None:
+            return
         # Tiled analysis supersedes any validation-ROI overlay workers that may
         # still be queued. Give the aggregate run its own generation so a late
         # one-window result cannot replace it after completion.
@@ -9473,17 +9641,13 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_random_roi_button.state(["disabled"])
         self._refresh_origami_action_states()
         self.status.set(f"Tiled origami analysis: preparing {selection_note} ROI tiles...")
-        self._run_worker(
-            lambda: self._tiled_origami_worker(
-                source_locs,
-                pixelsize,
-                tile_lattice,
-                tile_indices,
-                validated_params,
-                source_params,
-                overlay_params,
-            )
-        )
+        run = dict(checkpoint_version=1, run_id=uuid.uuid4().hex,
+                   analysis=self._capture_origami_analysis(),
+                   context=dict(source_locs=source_locs, pixelsize=pixelsize,
+                                tile_lattice=tile_lattice, tile_indices=tile_indices,
+                                identification_params=validated_params, source_params=source_params,
+                                overlay_params=overlay_params))
+        self._run_worker(lambda: self._checkpointed_tiled_worker(destination, run, initialize=True))
 
     def _tiled_origami_worker(
         self,
@@ -9494,6 +9658,7 @@ class PaintAnalysisApp(tk.Tk):
         identification_params: dict[str, Any],
         source_params: dict[str, Any],
         overlay_params: dict[str, Any],
+        checkpoint: TileCheckpoint | None = None,
     ) -> tuple[str, Any]:
         identification_params = dict(identification_params)
         identification_params["_tiled_full_field_display"] = len(tile_indices) == len(tile_lattice)
@@ -9602,13 +9767,18 @@ class PaintAnalysisApp(tk.Tk):
                     core_y0,
                     core_y1,
                 )
-                result_kind, tile_payload = self._identify_origami_worker(
-                    tile_points,
-                    tile_identification_params,
-                    tile_progress,
-                )
-                if result_kind != "origami_multi_picks":
-                    raise RuntimeError("Multi-template tiled analysis returned an unexpected result.")
+                tile_payload = checkpoint.load(lattice_index, tile_lattice[lattice_index], "multi") if checkpoint else None
+                if tile_payload is None:
+                    result_kind, tile_payload = self._identify_origami_worker(
+                        tile_points, tile_identification_params, tile_progress)
+                    if result_kind != "origami_multi_picks":
+                        raise RuntimeError("Multi-template tiled analysis returned an unexpected result.")
+                    if checkpoint:
+                        checkpoint.save(lattice_index, tile_lattice[lattice_index], "multi", tile_payload)
+                else:
+                    tile_progress(100.0, "Restored completed tile from checkpoint.")
+                for item in tile_payload["templates"]:
+                    item["params"]["identification_generation"] = identification_params.get("identification_generation")
                 multi_tile_payloads.append(tile_payload)
                 tile_unique_count = (
                     int(np.sum(np.asarray(tile_payload["counts"], dtype=int)))
@@ -9620,61 +9790,70 @@ class PaintAnalysisApp(tk.Tk):
                     gc.collect()
                 continue
 
-            picks = identify_origami_regions(
-                tile_points,
-                pick_bin_size_nm=float(identification_params["pick_bin_size_nm"]),
-                connect_distance_nm=float(identification_params["connect_distance_nm"]),
-                component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
-                candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
-                density_threshold=float(identification_params["density_threshold"]),
-                min_candidate_points=int(identification_params["min_candidate_points"]),
-                max_candidate_points=int(identification_params["max_candidate_points"]),
-                rows=int(identification_params["rows"]),
-                columns=int(identification_params["columns"]),
-                spacing_x_nm=float(identification_params["spacing_x_nm"]),
-                spacing_y_nm=float(identification_params["spacing_y_nm"]),
-                rectangle_margin_nm=float(identification_params["rectangle_margin_nm"]),
-                min_rectangle_confidence=float(identification_params["min_rectangle_confidence"]),
-                use_correlation_gate=bool(identification_params.get("use_correlation_gate", True)),
-                require_corner_support=bool(identification_params.get("require_corner_support", False)),
-                site_mask_radius_nm=float(identification_params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
-                min_supported_sites=int(identification_params.get("min_supported_sites", 0)),
-                min_site_evidence=float(identification_params.get("min_site_evidence", DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE)),
-                min_site_localizations=int(identification_params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS)),
-                min_supported_rows=int(identification_params.get("min_supported_rows", 0)),
-                min_supported_columns=int(identification_params.get("min_supported_columns", 0)),
-                max_site_spacing_error_nm=float(identification_params.get("max_site_spacing_error_nm", float("inf"))),
-                max_footprint_overlap_fraction=float(identification_params.get("max_footprint_overlap_fraction", 0.0)),
-                alignment_pixel_nm=float(identification_params["alignment_pixel_nm"]),
-                alignment_max_patch_pixels=int(identification_params.get("alignment_max_patch_pixels", DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)),
-                alignment_iterations=int(identification_params["alignment_iterations"]),
-                alignment_template_image=identification_params.get("alignment_template_image"),
-                template_pixel_size_x_nm=(
-                    float(identification_params["template_pixel_size_x_nm"])
-                    if identification_params.get("template_pixel_size_x_nm") is not None
-                    else None
-                ),
-                template_pixel_size_y_nm=(
-                    float(identification_params["template_pixel_size_y_nm"])
-                    if identification_params.get("template_pixel_size_y_nm") is not None
-                    else None
-                ),
-                progress_callback=tile_progress,
-            )
-            candidate_centers = np.asarray(
-                [np.median(region, axis=0) for region in picks.regions],
-                dtype=float,
-            ).reshape(-1, 2)
-            in_core = (
-                (candidate_centers[:, 0] >= core_x0)
-                & (candidate_centers[:, 0] < core_x1)
-                & (candidate_centers[:, 1] >= core_y0)
-                & (candidate_centers[:, 1] < core_y1)
-            )
-            picks.accepted_mask = np.asarray(picks.accepted_mask, dtype=bool) & in_core
-            candidate_count += int(np.count_nonzero(in_core))
+            saved_tile = checkpoint.load(lattice_index, tile_lattice[lattice_index], "single") if checkpoint else None
+            if saved_tile is None:
+                picks = identify_origami_regions(
+                    tile_points,
+                    pick_bin_size_nm=float(identification_params["pick_bin_size_nm"]),
+                    connect_distance_nm=float(identification_params["connect_distance_nm"]),
+                    component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
+                    candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
+                    density_threshold=float(identification_params["density_threshold"]),
+                    min_candidate_points=int(identification_params["min_candidate_points"]),
+                    max_candidate_points=int(identification_params["max_candidate_points"]),
+                    rows=int(identification_params["rows"]),
+                    columns=int(identification_params["columns"]),
+                    spacing_x_nm=float(identification_params["spacing_x_nm"]),
+                    spacing_y_nm=float(identification_params["spacing_y_nm"]),
+                    rectangle_margin_nm=float(identification_params["rectangle_margin_nm"]),
+                    min_rectangle_confidence=float(identification_params["min_rectangle_confidence"]),
+                    use_correlation_gate=bool(identification_params.get("use_correlation_gate", True)),
+                    require_corner_support=bool(identification_params.get("require_corner_support", False)),
+                    site_mask_radius_nm=float(identification_params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
+                    min_supported_sites=int(identification_params.get("min_supported_sites", 0)),
+                    min_site_evidence=float(identification_params.get("min_site_evidence", DEFAULT_ORIGAMI_MIN_SITE_PROMINENCE)),
+                    min_site_localizations=int(identification_params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS)),
+                    min_supported_rows=int(identification_params.get("min_supported_rows", 0)),
+                    min_supported_columns=int(identification_params.get("min_supported_columns", 0)),
+                    max_site_spacing_error_nm=float(identification_params.get("max_site_spacing_error_nm", float("inf"))),
+                    max_footprint_overlap_fraction=float(identification_params.get("max_footprint_overlap_fraction", 0.0)),
+                    alignment_pixel_nm=float(identification_params["alignment_pixel_nm"]),
+                    alignment_max_patch_pixels=int(identification_params.get("alignment_max_patch_pixels", DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)),
+                    alignment_iterations=int(identification_params["alignment_iterations"]),
+                    alignment_template_image=identification_params.get("alignment_template_image"),
+                    template_pixel_size_x_nm=(
+                        float(identification_params["template_pixel_size_x_nm"])
+                        if identification_params.get("template_pixel_size_x_nm") is not None
+                        else None
+                    ),
+                    template_pixel_size_y_nm=(
+                        float(identification_params["template_pixel_size_y_nm"])
+                        if identification_params.get("template_pixel_size_y_nm") is not None
+                        else None
+                    ),
+                    progress_callback=tile_progress,
+                )
+                candidate_centers = np.asarray(
+                    [np.median(region, axis=0) for region in picks.regions],
+                    dtype=float,
+                ).reshape(-1, 2)
+                in_core = (
+                    (candidate_centers[:, 0] >= core_x0)
+                    & (candidate_centers[:, 0] < core_x1)
+                    & (candidate_centers[:, 1] >= core_y0)
+                    & (candidate_centers[:, 1] < core_y1)
+                )
+                picks.accepted_mask = np.asarray(picks.accepted_mask, dtype=bool) & in_core
+                core_count = int(np.count_nonzero(in_core))
+                if checkpoint:
+                    checkpoint.save(lattice_index, tile_lattice[lattice_index], "single",
+                                    {"picks": picks, "core_count": core_count})
+            else:
+                picks, core_count = saved_tile["picks"], saved_tile["core_count"]
+                tile_progress(100.0, "Restored completed tile from checkpoint.")
+            candidate_count += core_count
             tile_pick_results.append(picks)
-            rejected_count += int(np.count_nonzero(in_core)) - picks.accepted_count
+            rejected_count += core_count - picks.accepted_count
             accepted_regions.extend(region.copy() for region in picks.accepted_aligned_regions)
             accepted_centers.extend(
                 np.median(region, axis=0)
@@ -9907,8 +10086,10 @@ class PaintAnalysisApp(tk.Tk):
         self._plot_origami_analysis(payload)
         self._refresh_origami_action_states()
 
-    def overlay_origamis(self) -> None:
-        picks = self.origami_pick_result
+    def overlay_origamis(self, template_name: str | None = None) -> None:
+        selected_name = template_name if template_name is not None else self.origami_template_result_view.get()
+        selected_payload = self.origami_multi_template_results.get(selected_name)
+        picks = selected_payload["picks"] if selected_payload is not None else self.origami_pick_result
         if picks is None:
             messagebox.showinfo("Origami not identified", "Click Identify Origami and inspect the colored outlines first.")
             return
@@ -9918,7 +10099,7 @@ class PaintAnalysisApp(tk.Tk):
                 "No candidates pass the point, site-prominence, grid-coverage, and spacing limits. Adjust the settings and run Identify Origami again.",
             )
             return
-        identification_params = dict(self.origami_identification_params or {})
+        identification_params = dict(selected_payload["params"] if selected_payload is not None else (self.origami_identification_params or {}))
         try:
             params = {
                 "rows": int(identification_params.get("rows", self.origami_rows.get())),
@@ -9946,15 +10127,15 @@ class PaintAnalysisApp(tk.Tk):
                 "overlay_blur_nm": float(self.origami_overlay_blur_nm.get()),
                 "source_path": self.origami_loaded_source_path,
                 "source_label": (
-                    f"{self.origami_loaded_source_label} — {self.origami_template_result_view.get()}"
-                    if (self.origami_template_result_view.get() in self.origami_multi_template_results
-                        or self.origami_template_result_view.get() == "Unclassified")
+                    f"{self.origami_loaded_source_label} — {selected_name}"
+                    if (selected_name in self.origami_multi_template_results
+                        or selected_name == "Unclassified")
                     else self.origami_loaded_source_label
                 ),
                 "template_name": (
-                    self.origami_template_result_view.get()
-                    if (self.origami_template_result_view.get() in self.origami_multi_template_results
-                        or self.origami_template_result_view.get() == "Unclassified")
+                    selected_name
+                    if (selected_name in self.origami_multi_template_results
+                        or selected_name == "Unclassified")
                     else None
                 ),
                 "source_count": len(self.origami_source_points_nm) if self.origami_source_points_nm is not None else 0,
@@ -9982,6 +10163,8 @@ class PaintAnalysisApp(tk.Tk):
         )
         rejected_count = len(picks.regions) - picks.accepted_count
         self.status.set(f"Building fast overlay for {len(accepted_regions)} image-aligned origamis without G5M...")
+        if template_name is not None:
+            self.origami_multi_template_overlays_building.add(template_name)
         self._run_worker(lambda: self._overlay_origami_worker(accepted_regions, accepted_centers, rejected_count, params, False))
 
     def refine_origami_overlay_with_g5m(self) -> None:
@@ -10766,8 +10949,10 @@ class PaintAnalysisApp(tk.Tk):
                 elif kind == "result":
                     try:
                         result_kind, result_payload = payload
-                        if result_kind == "roi_csv_export":
+                        if result_kind in {"roi_csv_export", "drift_csv_export"}:
                             self.status.set(result_payload)
+                        elif result_kind == "tiled_resume":
+                            self._resume_tiled_checkpoint(*result_payload)
                         elif result_kind == "cached_session":
                             self.session_load_in_progress = False
                             cached_loaded = result_payload["loaded"]
@@ -11497,6 +11682,7 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_canvas.draw_idle()
         self.origami_figure.clear()
         self.origami_figure.suptitle("1. Load source   2. Identify   3. Overlay")
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.notebook.select(RAW_MAP_TAB)
 
@@ -12096,11 +12282,12 @@ class PaintAnalysisApp(tk.Tk):
             f"{len(points):,} source points; display pixel {pixel_x:.3g} × {pixel_y:.3g} nm; "
             f"blur={preview.get('blur_method', 'smooth')}"
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_last_rendered_plot_option = "Loaded source data"
         self._configure_origami_navigation_controls()
         self.notebook.select(ORIGAMI_TAB)
-        # The cached preview was produced before the Origami tab became
+        # The cached preview was produced before the Classification tab became
         # visible, often using the map tab's zoom/render resolution. Wait
         # until Tk has laid out this canvas, then render its actual viewport.
         self.after_idle(self._rerender_loaded_origami_source_view)
@@ -12718,17 +12905,10 @@ class PaintAnalysisApp(tk.Tk):
         axis.callbacks.connect("xlim_changed", self._on_origami_view_limits_changed)
         axis.callbacks.connect("ylim_changed", self._on_origami_view_limits_changed)
         axis.set_title(
-            f"Origami template classification: {sum(self.origami_multi_template_counts.values()):,} assigned; "
-            f"{self.origami_multi_template_unclassified_count:,} unclassified\n"
-            f"Color identifies the winning template; display pixel "
-            f"{float(preview['effective_pixel_x_nm']):.3g} × {float(preview['effective_pixel_y_nm']):.3g} nm; "
-            f"showing {shown}/{total_visible} classified footprints in view"
-            + (("\nFull source field analyzed, including partial edge tiles."
-                if any(payload.get("params", {}).get("_include_partial_edge_tiles", False) for payload in self.origami_multi_template_results.values())
-                else "\nFull source field shown; classification covers complete ROI tiles only.")
-               if any(payload.get("params", {}).get("_tiled_full_field_display", False)
-                      for payload in self.origami_multi_template_results.values()) else "")
+            f"Identified origami — {sum(self.origami_multi_template_counts.values()):,} assigned; "
+            f"{self.origami_multi_template_unclassified_count:,} unclassified"
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_last_rendered_plot_option = "Identified origami template matches"
         self._configure_origami_navigation_controls()
@@ -12803,17 +12983,6 @@ class PaintAnalysisApp(tk.Tk):
         )
         is_classification_view = selected_template in self.origami_multi_template_results
         accepted_label = "classified as this type" if is_classification_view else "accepted"
-        outline_label = (
-            "solid assigned to this type; dashed failed or assigned elsewhere"
-            if is_classification_view
-            else "solid accepted, dashed rejected"
-        )
-        use_correlation_gate = bool(identification_params.get("use_correlation_gate", True))
-        correlation_gate_text = (
-            f"correlation ≥ {float(identification_params.get('min_rectangle_confidence', self.origami_min_rectangle_confidence.get())):g}; "
-            if use_correlation_gate
-            else "correlation shown for QC only; "
-        )
         bic_computed = bool(identification_params.get("compute_grid_blob_bic", True))
         bic_summary = (
             f"grid-vs-blob ΔBIC min/median/max = {np.min(picks.grid_vs_blob_delta_bic):.1f}/"
@@ -12832,32 +13001,14 @@ class PaintAnalysisApp(tk.Tk):
         )
         inspection_stage = int(identification_params.get("_inspection_stage", 5))
         is_stage_preview = not is_classification_view and inspection_stage in {3, 4}
-        heading = (
-            f"Identified origami{template_title}: {picks.accepted_count}/{len(picks.regions)} {accepted_label} "
-            f"({correlation_gate_text}sparse sites ≥ {int(identification_params.get('min_supported_sites', 0))}; "
-            f"site-gap shown for QC only; {'ΔBIC shown for QC only' if bic_computed else 'ΔBIC deferred'}; "
-            f"spacing error ≤ {float(identification_params.get('max_site_spacing_error_nm', float('inf'))):g} nm; "
-            f"{outline_label})"
-        )
+        heading = f"Identified origami{template_title} — {picks.accepted_count:,} {accepted_label}"
         if is_stage_preview:
             preview_name = "Step 2 · Fit and Inspect" if inspection_stage == 3 else "Step 3 · Inspect Digital Pixels"
-            heading = (
-                f"{preview_name}: {picks.accepted_count}/{len(picks.regions)} pass fit gates; "
-                f"{correlation_gate_text}classification pending Step 4"
-            )
-        axis.set_title(
-            f"{heading}\n"
-            f"{count_summary}; {confidence_summary}; {site_gap_summary}; {support_summary}\n"
-            f"footprint {picks.rectangle_width_nm:g} × {picks.rectangle_height_nm:g} nm; alignment pixel "
-            f"{picks.alignment_pixel_nm:.3g} nm; display pixel "
-            f"{float(preview['effective_pixel_x_nm']):.3g} × {float(preview['effective_pixel_y_nm']):.3g} nm; "
-            f"pick bin {float(self.origami_pick_bin_nm.get()):g} nm; density ≥ {picks.density_threshold:.3g}; "
-            f"showing {visible_footprints}/{total_visible} footprints in view"
-        )
-        if selected_template == "Unclassified":
-            axis.set_title(f"Unclassified origami: {picks.accepted_count:,} candidates\n"
-                           f"Saved alignment for QC; reference sites do not imply a winning template. "
-                           f"Showing {visible_footprints}/{total_visible} footprints in view")
+            heading = f"{preview_name} — {picks.accepted_count:,}/{len(picks.regions):,} pass fit gates"
+        elif selected_template == "Unclassified":
+            heading = f"Unclassified origami — {picks.accepted_count:,} candidates"
+        axis.set_title(heading)
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_last_rendered_plot_option = "Identified origami template matches"
         self._configure_origami_navigation_controls()
@@ -12968,6 +13119,7 @@ class PaintAnalysisApp(tk.Tk):
             f"ROI {roi_number} • random tile {tile_index + 1}/{available_tile_count} • {len(picks.regions)} candidates"
         )
         self._configure_origami_navigation_controls()
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.notebook.select(ORIGAMI_TAB)
@@ -13227,6 +13379,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_match_roi_label.set(
             f"Candidate {selected_region_index + 1}/{len(selected_picks.regions):,}"
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Identified origami match ROI"
@@ -13504,6 +13657,7 @@ class PaintAnalysisApp(tk.Tk):
         selected_panel = self.origami_match_panel.get()
         if selected_panel == "Alignment stages":
             plot_alignment_pose_history(self.origami_figure, picks, region_index)
+            PaintAnalysisApp._apply_origami_legend_visibility(self)
             self.origami_canvas.draw_idle()
             return
         if canvas_width < 760 and selected_panel == "All panels":
@@ -13637,6 +13791,7 @@ class PaintAnalysisApp(tk.Tk):
             fontsize=10,
             y=0.98,
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Identified origami match ROI"
@@ -13817,6 +13972,7 @@ class PaintAnalysisApp(tk.Tk):
             f"Coarse identification map — {roi_label}; cached result, viewing does not rerun identification",
             fontsize=12,
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Coarse identification density"
@@ -14604,6 +14760,7 @@ class PaintAnalysisApp(tk.Tk):
             title,
         )
         axis.set_title(title)
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         render_subject = (
             "loaded source viewport"
@@ -14645,6 +14802,7 @@ class PaintAnalysisApp(tk.Tk):
         ):
             axis = self.origami_figure.axes[0]
             shown, visible = self._draw_all_template_classifications(axis)
+            PaintAnalysisApp._apply_origami_legend_visibility(self)
             self.origami_canvas.draw_idle()
             self.status.set(
                 f"Showing all template classifications together: {shown:,}/{visible:,} visible assigned fits; "
@@ -14657,6 +14815,7 @@ class PaintAnalysisApp(tk.Tk):
             return
         axis = self.origami_figure.axes[0]
         shown, visible = self._draw_visible_origami_footprints(axis, picks)
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         overlays: list[str] = []
         if self.origami_show_theoretical_overlay.get():
@@ -14696,6 +14855,9 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_multi_template_overlay_results[str(result_template)] = dict(payload)
             getattr(self, "origami_multi_template_overlays_building", set()).discard(result_template)
             if self.origami_template_result_view.get() != result_template:
+                if (self.origami_template_result_view.get() == "All templates"
+                        and self.origami_plot_option.get() == "Aligned density"):
+                    self.render_origami_plot()
                 return
         self.origami_result = result
         self.origami_result_source = str(payload["source"])
@@ -14829,6 +14991,80 @@ class PaintAnalysisApp(tk.Tk):
                 self.render_origami_plot()
                 return
 
+    def _plot_all_template_aligned_density(self) -> None:
+        names = list(self.origami_multi_template_results)
+        order = self.__dict__.get("origami_type_count_order", ())
+        names = list(dict.fromkeys([name for name in order if name in names] + names))
+        self.origami_figure.clear()
+        self.origami_figure.set_layout_engine("constrained", w_pad=6 / 72, h_pad=6 / 72)
+        columns = min(4, len(names))
+        axes = self.origami_figure.subplots(math.ceil(len(names) / columns), columns, squeeze=False)
+        missing = []
+        for axis, name in zip(axes.flat, names):
+            classification = self.origami_multi_template_results[name]
+            picks = classification["picks"]
+            axis.set_title(f"{name}\n{picks.accepted_count:,} origami", fontsize=10)
+            payload = self.origami_multi_template_overlay_results.get(name)
+            if picks.accepted_count == 0 or payload is None:
+                axis.text(0.5, 0.5, "No assigned origami" if picks.accepted_count == 0 else "Preparing aligned density…",
+                          ha="center", va="center", transform=axis.transAxes, fontsize=9)
+                axis.set_axis_off()
+                if picks.accepted_count and payload is None:
+                    missing.append(name)
+                continue
+            result = payload["result"]
+            settings = payload["render_settings"]
+            # The density is reusable until this classification's overlay is replaced.
+            density = payload.get("aligned_density_render")
+            if density is None:
+                density = render_aligned_origami_density(result.aligned_points, **settings,
+                                                        symmetrize_180=result.symmetrized_180)
+                payload["aligned_density_render"] = density
+            image = axis.imshow(density["image"], extent=density["extent"], origin="lower",
+                                cmap="magma", aspect="equal", interpolation="none")
+            colorbar = self.origami_figure.colorbar(image, ax=axis, shrink=0.8, pad=0.03)
+            colorbar.set_label("Mean points / origami / bin", fontsize=8)
+            colorbar.ax.tick_params(labelsize=7)
+            # Overlay helpers read the current class. Restore that context before
+            # drawing the canvas or starting any asynchronous work.
+            previous_name = self.origami_template_result_view.get()
+            previous_picks = self.origami_pick_result
+            previous_params = self.origami_identification_params
+            previous_result = self.origami_result
+            previous_roi_position = self.origami_roi_history_position
+            try:
+                self.origami_template_result_view.set(name)
+                self.origami_pick_result = picks
+                self.origami_identification_params = classification["params"]
+                self.origami_result = result
+                self.origami_roi_history_position = -1
+                grid = self._origami_digital_overlay_grid(result, settings)
+                self._draw_aligned_density_display_overlays(axis, result, grid)
+            finally:
+                self.origami_template_result_view.set(previous_name)
+                self.origami_pick_result = previous_picks
+                self.origami_identification_params = previous_params
+                self.origami_result = previous_result
+                self.origami_roi_history_position = previous_roi_position
+            axis.set_xlabel("aligned x (nm)", fontsize=8)
+            axis.set_ylabel("aligned y (nm)", fontsize=8)
+            axis.tick_params(labelsize=8)
+        for axis in list(axes.flat)[len(names):]:
+            axis.set_visible(False)
+        self.origami_figure.suptitle("Aligned density — all templates")
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
+        self.origami_canvas.draw_idle()
+        self.origami_toolbar.update()
+        self.origami_last_rendered_plot_option = "Aligned density"
+        self._configure_origami_navigation_controls()
+        self.notebook.select(ORIGAMI_TAB)
+        self.status.set(f"Aligned density: {len(names) - len(missing)}/{len(names)} classifications ready. "
+                        "Each panel shows mean density per origami with its own color scale.")
+        # Build missing overlays one at a time; completion redraws this view and
+        # starts the next. Switching away does not interrupt or select a class.
+        if missing and not self.origami_multi_template_overlays_building:
+            self.overlay_origamis(template_name=missing[0])
+
     def _cached_aligned_origami_density(
         self,
         result: OrigamiAnalysisResult,
@@ -14859,8 +15095,15 @@ class PaintAnalysisApp(tk.Tk):
     def render_origami_plot(self) -> None:
         option = self.origami_plot_option.get()
         self.origami_match_panel_combo.state(["disabled"])
+        if (option == "Aligned density" and self.origami_template_result_view.get() == "All templates"
+                and self.origami_multi_template_results):
+            self._plot_all_template_aligned_density()
+            return
         if option == "Origami type counts":
             self._plot_origami_type_counts()
+            return
+        if option == "Open vs closed":
+            self._plot_open_vs_closed()
             return
         if option == "Digital-pixel spatial heatmap":
             self._plot_digital_pixel_spatial_heatmap()
@@ -14902,6 +15145,7 @@ class PaintAnalysisApp(tk.Tk):
                 axis.set_axis_off()
                 axis.set_title(f"{option} — {name}")
                 axis.text(0.5, 0.5, "No origami in this classification.", ha="center", va="center", transform=axis.transAxes)
+                PaintAnalysisApp._apply_origami_legend_visibility(self)
                 self.origami_canvas.draw_idle()
                 self.origami_toolbar.update()
                 self.origami_last_rendered_plot_option = option
@@ -15037,6 +15281,7 @@ class PaintAnalysisApp(tk.Tk):
             f"Origami overlay — {self.origami_result_source}; {self.origami_result_source_count:,} source points",
             fontsize=12,
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = option
@@ -15087,8 +15332,11 @@ class PaintAnalysisApp(tk.Tk):
         def apply():
             self.origami_type_count_order = list(items.get(0, tk.END))
             dialog.destroy()
-            self.origami_plot_option.set("Origami type counts")
-            self._plot_origami_type_counts()
+            if self.origami_plot_option.get() == "Open vs closed":
+                self._plot_open_vs_closed()
+            else:
+                self.origami_plot_option.set("Origami type counts")
+                self._plot_origami_type_counts()
 
         buttons = ttk.Frame(dialog)
         buttons.pack(padx=12, pady=10)
@@ -15164,6 +15412,7 @@ class PaintAnalysisApp(tk.Tk):
             "Bars are hard assignments; diamonds sum equal-prior probabilities across all candidates"
         )
         axis.grid(True, axis="y", alpha=0.25)
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Origami type counts"
@@ -15174,6 +15423,84 @@ class PaintAnalysisApp(tk.Tk):
             + ", ".join(f"{name}={count:,}" for name, count in zip(names, counts))
             + f"; unclassified={self.origami_multi_template_unclassified_count:,}. "
             "Choose a Classification view to inspect one type and build its separate overlays."
+        )
+
+    def _plot_open_vs_closed(self) -> None:
+        names = list(self.origami_multi_template_results)
+        saved_order = self.__dict__.get("origami_type_count_order", ())
+        names = list(dict.fromkeys([name for name in saved_order if name in names] + names))
+        schemes = {}
+        scheme_labels = {}
+        aliases = {}
+        for name in names:
+            match = re.fullmatch(r"(.+?)[_\s-]+(open|closed|close|on|off)", name.strip(), flags=re.IGNORECASE)
+            if match:
+                prefix, suffix = match.groups()
+                # Match the complete scheme prefix, never bit1 with bit10 or
+                # bit1_open_rigid. Ignore case and separator spelling only.
+                scheme = re.sub(r"[_\s-]+", "_", prefix).casefold()
+                scheme_labels.setdefault(scheme, prefix)
+                states = schemes.setdefault(scheme, {})
+                state = "open" if suffix.lower() in {"open", "on"} else "closed"
+                if suffix.lower() != state:
+                    aliases.setdefault(scheme, []).append(f"{name} → {state}")
+                states[state] = states.get(state, 0) + int(self.origami_multi_template_counts.get(name, 0))
+        pairs = {scheme: counts for scheme, counts in schemes.items()
+                 if "open" in counts and "closed" in counts}
+        self.origami_figure.clear()
+        self.origami_figure.set_layout_engine("constrained", w_pad=6 / 72, h_pad=6 / 72)
+        axis = self.origami_figure.subplots(1, 1)
+        if pairs:
+            totals = np.array([counts["open"] + counts["closed"] for counts in pairs.values()])
+            opened = np.divide(
+                100.0 * np.array([counts["open"] for counts in pairs.values()]), totals,
+                out=np.zeros(len(totals), dtype=float), where=totals > 0,
+            )
+            closed = np.where(totals > 0, 100.0 - opened, 0.0)
+            positions = np.arange(len(pairs))
+            axis.bar(positions, opened, color="#2563eb", edgecolor="white", label="Open")
+            axis.bar(positions, closed, bottom=opened, color="#ea580c", edgecolor="white", label="Closed")
+            for index, (total, open_percent, closed_percent) in enumerate(zip(totals, opened, closed)):
+                # Tiny segments use a label above the bar to avoid overlapping text.
+                small = []
+                for state, value, bottom in (("Open", open_percent, 0), ("Closed", closed_percent, open_percent)):
+                    if value >= 8:
+                        axis.text(index, bottom + value / 2, f"{value:.1f}%", ha="center", va="center", color="white")
+                    elif value > 0:
+                        small.append(f"{state} {value:.1f}%")
+                label = f"n={total:,}" if total else "n=0 (no data)"
+                if small:
+                    label += "\n" + ", ".join(small)
+                axis.annotate(label, (index, 100 if total else 0), xytext=(0, 7),
+                              textcoords="offset points", ha="center", va="bottom", fontsize=9)
+            axis.set_xticks(positions, labels=[scheme_labels[key] for key in pairs], rotation=20, ha="right")
+            axis.legend(loc="upper left", bbox_to_anchor=(1.01, 1), borderaxespad=0)
+        else:
+            axis.text(0.5, 0.5, "No matching open/on and closed/close/off template pairs.\n"
+                      "Load both states of a scheme and run classification.",
+                      ha="center", va="center", transform=axis.transAxes)
+            axis.set_xticks([])
+        axis.set_ylim(0, 120)
+        axis.set_yticks(np.arange(0, 101, 20), labels=[f"{value}%" for value in range(0, 101, 20)])
+        axis.set_ylabel("Percentage within each bit scheme")
+        inferred = [alias for scheme in pairs for alias in aliases.get(scheme, ())]
+        title = "Open vs closed\nEach bar uses open + closed assignments for that scheme"
+        if inferred:
+            title += "\nSuffix aliases: on = open; off/close = closed"
+        axis.set_title(title)
+        axis.set_axisbelow(True)
+        axis.grid(True, axis="y", alpha=0.25)
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
+        self.origami_canvas.draw_idle()
+        self.origami_toolbar.update()
+        self.origami_last_rendered_plot_option = "Open vs closed"
+        self._configure_origami_navigation_controls()
+        self.notebook.select(ORIGAMI_TAB)
+        self.status.set(
+            f"Open vs closed: {len(pairs)} paired bit schemes. "
+            "Unclassified particles and templates without an open/closed partner are excluded. "
+            "Scheme order follows the type-count x-axis order."
+            + (" Inferred states: " + "; ".join(inferred) + "." if inferred else "")
         )
 
     def _plot_digital_pixel_spatial_heatmap(self) -> None:
@@ -15238,6 +15565,7 @@ class PaintAnalysisApp(tk.Tk):
                                      ax=list(axes.flat)[:len(cohorts)],
                                      label="Fraction of measured assigned origami with pixel ON", shrink=0.8)
         self.origami_figure.suptitle("Digital-pixel presence by physical position")
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Digital-pixel spatial heatmap"
@@ -15296,6 +15624,7 @@ class PaintAnalysisApp(tk.Tk):
         except (ValueError, IndexError, KeyError) as exc:
             messagebox.showinfo("Candidate review unavailable", str(exc))
             return
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Digital bit derivation"
@@ -15325,6 +15654,7 @@ class PaintAnalysisApp(tk.Tk):
         except ValueError as exc:
             messagebox.showinfo("Classification audit unavailable", str(exc))
             return
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = view
@@ -15506,6 +15836,7 @@ class PaintAnalysisApp(tk.Tk):
             pad=0.02,
             shrink=0.92,
         )
+        PaintAnalysisApp._apply_origami_legend_visibility(self)
         self.origami_canvas.draw_idle()
         self.origami_toolbar.update()
         self.origami_last_rendered_plot_option = "Digital-group bias heatmap"
@@ -16866,7 +17197,7 @@ class PaintAnalysisApp(tk.Tk):
                 self.origami_result_source_count = int(cached["source_count"])
                 self.origami_result_occupancy_threshold = int(cached["occupancy_threshold"])
             global_views = {"Coarse identification density", "Identified origami template matches",
-                            "Origami type counts", "Digital-group bias heatmap",
+                            "Origami type counts", "Open vs closed", "Aligned density", "Digital-group bias heatmap",
                             "Digital-group threshold audit", "Unmatched-pattern audit", "Unclassified evidence distributions",
                             "Threshold sensitivity", "Digital-pixel spatial heatmap"}
             if selected == "All templates" and self.origami_plot_option.get() not in global_views:

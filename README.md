@@ -66,6 +66,10 @@ to the final localization-table size.
 
 ## Save an ROI as a localization CSV
 
+Use **Select Whole Image** in the sidebar ROI panel to select the full loaded
+image bounds in one click. For a previously cropped file, this uses its saved
+crop bounds. The selection applies to ROI analysis and exports.
+
 Drag a rectangle on the raw map immediately after loading, or on the corrected
 map after applying drift correction. In the sidebar ROI panel, choose **Save Raw
 ROI CSV** or **Save Corrected ROI CSV** and choose a new filename. Each button
@@ -100,7 +104,7 @@ disable automatic restoration.
 
 ## Save and reopen Origami analysis
 
-Use **Save Analysis…** and **Load Analysis…** at the bottom of the Origami
+Use **Save Analysis…** and **Load Analysis…** at the bottom of the Classification
 sidebar. After completing ROI or whole-image analysis, save a `.paintanalysis`
 file. Closing the app with Origami results open prompts to save, close without
 saving, or cancel. Choosing save closes only after a successful write; canceling
@@ -126,6 +130,36 @@ Saves replace the destination only after writing successfully. Files use a
 versioned ZIP archive of JSON and NumPy arrays, without executable pickle data.
 This is separate from the automatic drift-correction cache described above.
 
+### Recover an interrupted tiled analysis
+
+**Analyze Whole Image as Tiles** and **Analyze N Tiles** ask for a checkpoint
+destination before starting. Choose a folder on an external drive if desired.
+The app creates a separate `paint-tiles-…` recovery folder there and displays its
+path below the tiled-analysis controls.
+
+Before processing tiles, the app saves a `run.paintanalysis` snapshot containing
+the source localization data, templates, settings, tile boundaries, and selected
+tile indices. It then saves each completed nonempty tile to its own file using
+an atomic replacement. If the app crashes, completed tile files remain usable;
+the tile that was still processing may need to run again. Empty tiles are skipped
+quickly from the saved source data.
+
+After restarting, click **Resume Tiled Analysis…** in the Classification tab and
+select that `paint-tiles-…` folder. The app restores the saved dataset and settings,
+reuses completed tiles, and processes the remaining ones. Original CSV and template
+files are not required. Current settings are replaced by the saved run settings;
+start a new run to use different thresholds or templates. If checkpoint writing
+fails, for example because the drive is full, the run stops and previously saved
+tiles are retained. Free space or copy the entire recovery folder to a larger
+drive, then resume from that folder.
+
+Once the run finishes, use **Save Analysis…** to save the normal analysis session.
+Recovery folders are retained until you delete them, so you can also recover from
+a crash during final aggregation or before saving the final session. Delete the
+recovery folder only after saving and checking the final analysis. Checkpoints
+protect progress but do not make the pipeline fully disk-backed: source data and
+combined results still consume RAM.
+
 ## Render And Drift
 
 The map uses Picasso Render directly:
@@ -144,6 +178,23 @@ Correction methods:
   then `Apply Drift Correction`. Columns such as `Frame`, `x-drift (nm)`, and
   `y-drift (nm)` are recognized; optional z drift is applied when both files
   contain z values. Nanometer drift is converted using the localization pixel size.
+
+After correction, click **Save Drift CSV…** in the Drift Correction panel to export
+the current trace as `Frame`, `x-drift (nm)`, `y-drift (nm)`, and optional
+`z-drift (nm)`. The export preserves frame numbers and the displacement actually
+subtracted during correction; it does not reset the trace to zero.
+
+To estimate drift from a spatial crop and apply it to the full acquisition:
+
+1. Select an ROI and use **Save Raw ROI CSV**. Keep its accompanying YAML file,
+   which preserves the acquisition frame count and pixel size.
+2. Load that cropped CSV, run RCC or AIM, then click **Save Drift CSV…**.
+3. Load the original uncropped raw localizations, choose **Load Drift CSV**, select
+   the saved trace, and click **Apply Drift Correction**.
+
+Both datasets must use the same acquisition frame numbering. The drift CSV must
+cover every target frame; missing frames are rejected rather than extrapolated.
+Drift traces restored from saved analysis sessions can also be exported.
 
 `Segmentation` is frames per drift segment. `RCC lattice pitch (nm)` locates the lattice
 directions in the summed Fourier spectrum and removes narrow notches at the fundamental
@@ -282,7 +333,7 @@ the optional theoretical-site overlay. Random inspection does not replace the
 validated ROI, alter its settings, or build an overlay; after every available
 tile has been visited, sampling begins a new randomized cycle.
 
-The Origami tab uses a plot-first workspace. Source, Identify, and Overlay are
+The Classification tab uses a plot-first workspace. Source, Identify, and Overlay are
 stages in one collapsible left sidebar with a single scrollbar; only
 the selected stage is shown. The current stage's primary action remains pinned
 to the bottom. Identify settings are visibly divided into numbered workflow
@@ -477,6 +528,30 @@ per-template overlays are cached while switching between classified types. To
 count the complete image rather than the selected ROI, disable the source ROI
 option before loading Origami source data.
 
+Select **All templates** under Classification and **Aligned density** under View
+to compare classifications in a labeled grid, with up to four panels per row.
+Each panel shows the template name, assigned count, and mean density per origami
+with its own color scale. Display overlay toggles apply to each panel using that
+template's group definitions. Uncheck **Show legends** in the display controls
+to hide legends without hiding overlays or color scales. This preference is saved
+with the analysis and also applies to other Classification plots.
+Panels follow the type-count x-axis order; empty
+classifications show “No assigned origami”. Missing overlays build one at a time
+from saved aligned localizations, including in loaded analysis sessions.
+
+Choose **Open vs closed** for a stacked percentage bar per bit scheme. Templates
+ending in `_open` and `_closed` are paired by their shared prefix, for example
+`bit1_open` and `bit1_closed`. Matching ignores case and differences between spaces,
+hyphens, and underscores. `_on` also means open; `_off` and `_close` mean closed,
+so `bit2_open` pairs with `bit2_off`. Alias use is noted in the plot and status.
+Multiple templates for the same scheme/state contribute their combined counts.
+Each percentage uses that pair's assigned counts:
+open / (open + closed) and closed / (open + closed). The total sample count appears
+above each bar. Unclassified particles, unrecognized suffixes, and schemes
+without both states are excluded. Pairs with zero assignments show “no data”.
+**Type-count x-axis order…** also controls scheme order, using the first occurrence
+of either state. The view works with loaded analysis sessions.
+
 With a custom image, that raster drives rotation, translation, and the reported
 correlation, including dark barcode locations as negative-space evidence. Each
 separate bright component in the image also defines a theoretical docking site
@@ -564,7 +639,7 @@ render also recalculates its display-density limits from the populated pixels,
 so zoomed regions do not retain the full-ROI contrast range. The Origami toolbar
 Home button restores the original validation/inspection extent and immediately
 rerenders that complete viewport rather than stretching the last zoom tile.
-Loading source data likewise rerenders once the Origami tab is visible, so its
+Loading source data likewise rerenders once the Classification tab is visible, so its
 initial resolution is based on the Origami canvas rather than the map tab where
 the ROI was selected.
 The plot toolbar's Home, Back, and Forward actions trigger the same rerender

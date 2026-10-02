@@ -98,7 +98,7 @@ def populate(a):
     return a
 
 VIEWS = ['Coarse identification density', 'Identified origami template matches',
-    'Origami type counts', 'Digital-group bias heatmap',
+    'Origami type counts', 'Open vs closed', 'Digital-group bias heatmap',
     'Digital-group threshold audit', 'Unmatched-pattern audit', 'Unclassified evidence distributions',
     'Threshold sensitivity',
     'Digital-pixel spatial heatmap', 'Individual origami gallery', 'Individual site assignments',
@@ -128,7 +128,7 @@ def matrix(a, monkeypatch):
         a.origami_template_result_view.set(name)
         a.origami_plot_option.set('Origami type counts')
         a._on_origami_template_result_selection()
-        for view in (VIEWS[:9] if name == 'All templates' else VIEWS):
+        for view in (VIEWS[:10] if name == 'All templates' else VIEWS):
             notices.clear()
             a.origami_plot_option.set(view)
             if view in ('Selected origami detail', 'Digital bit derivation'):
@@ -305,3 +305,108 @@ def test_load_invalidates_pending_display_updates():
     assert not restored.origami_zoom_render_running
     assert not restored.origami_zoom_render_pending
     assert restored.origami_source_draw_signature is None
+
+
+def test_open_closed_pairs_survive_saved_session(tmp_path):
+    live = populate(app())
+    live.origami_multi_template_results = {
+        'bit1_open': live.origami_multi_template_results['A'],
+        'bit1_off': live.origami_multi_template_results['Full'],
+    }
+    live.origami_multi_template_counts = {'bit1_open': 12, 'bit1_off': 12}
+    live.origami_template_result_view.set('All templates')
+    live.origami_plot_option.set('Open vs closed')
+    live.render_origami_plot()
+    path = tmp_path / 'open_closed.paintanalysis'
+    save_analysis_session(path, live._capture_origami_analysis())
+    restored = app()
+    restored._run_worker = lambda fn: pytest.fail('Open vs closed should not build overlays')
+    restored._install_origami_analysis(load_analysis_session(path, live._analysis_record_types()))
+    assert restored.origami_plot_option.get() == 'Open vs closed'
+    assert restored.origami_last_rendered_plot_option == 'Open vs closed'
+    assert [bar.get_height() for bar in restored.origami_figure.axes[0].patches] == [50, 50]
+    assert [t.get_text() for t in restored.origami_figure.axes[0].get_xticklabels()] == ['bit1']
+
+
+def test_all_templates_density_builds_sequentially_and_restores(tmp_path):
+    from dataclasses import replace
+    live = populate(app())
+    original = live.origami_multi_template_results['A']
+    live.origami_multi_template_results['Empty'] = {
+        'picks': replace(original['picks'], accepted_mask=np.zeros(36, dtype=bool)),
+        'params': original['params']}
+    live.origami_multi_template_counts['Empty'] = 0
+    live.origami_type_count_order = ['Full', 'A', 'Empty']
+    live.origami_template_result_view.set('All templates')
+    live.origami_plot_option.set('Aligned density')
+    live.origami_show_theoretical_overlay.set(True)
+    live.origami_show_site_diagnostics.set(True)
+    queued = []
+    live._run_worker = queued.append
+    live._on_origami_template_result_selection()
+    assert len(queued) == 1
+    assert live.origami_multi_template_overlays_building == {'Full'}
+    live.render_origami_plot()
+    assert len(queued) == 1  # redraws do not duplicate a running worker
+    for name in ('Full', 'A'):
+        kind, payload = queued.pop(0)()
+        assert kind == 'origami'
+        assert payload['template_name'] == name
+        live._plot_origami_analysis(payload)
+    assert not queued
+    assert not live.origami_multi_template_overlays_building
+    assert live.origami_template_result_view.get() == 'All templates'
+    assert live.origami_last_rendered_plot_option == 'Aligned density'
+    panels = [axis for axis in live.origami_figure.axes if axis.get_xlabel() == 'aligned x (nm)']
+    assert len(panels) == 2
+    assert panels[0].get_title().startswith('Full\n12 origami')
+    assert panels[1].get_title().startswith('A\n12 origami')
+    for axis, name in zip(panels, ('Full', 'A')):
+        cached = live.origami_multi_template_overlay_results[name]
+        expected = gui.render_aligned_origami_density(
+            cached['result'].aligned_points, **cached['render_settings'],
+            symmetrize_180=cached['result'].symmetrized_180)
+        np.testing.assert_allclose(axis.images[0].get_array(), expected['image'])
+    assert all(axis.get_legend().get_visible() for axis in panels)
+    live.origami_show_legends.set(False)
+    live._toggle_origami_legends()
+    assert all(not axis.get_legend().get_visible() for axis in panels)
+    live.origami_show_legends.set(True)
+    live._toggle_origami_legends()
+    assert all(axis.get_legend().get_visible() for axis in panels)
+    live.origami_show_legends.set(False)
+    live.render_origami_plot()
+    before = snapshot(live)
+    path = tmp_path / 'all_density.paintanalysis'
+    save_analysis_session(path, live._capture_origami_analysis())
+    restored = app()
+    restored._run_worker = lambda fn: pytest.fail('Rebuilt a saved density overlay')
+    restored._install_origami_analysis(load_analysis_session(path, live._analysis_record_types()))
+    assert restored.origami_template_result_view.get() == 'All templates'
+    assert restored.origami_plot_option.get() == 'Aligned density'
+    assert not restored.origami_show_legends.get()
+    restored_panels = [axis for axis in restored.origami_figure.axes if axis.get_xlabel() == 'aligned x (nm)']
+    assert all(not axis.get_legend().get_visible() for axis in restored_panels)
+    after = snapshot(restored)
+    assert len(before) == len(after)
+    for original, reopened in zip(before, after):
+        if isinstance(original, np.ndarray): np.testing.assert_allclose(original, reopened)
+        else: assert original == reopened
+
+
+def test_all_template_density_completion_does_not_switch_away_from_selected_view():
+    live = populate(app())
+    live.origami_template_result_view.set('All templates')
+    live.origami_plot_option.set('Aligned density')
+    queued = []
+    live._run_worker = queued.append
+    live.render_origami_plot()
+    live.origami_plot_option.set('Origami type counts')
+    live.render_origami_plot()
+    _, payload = queued.pop(0)()
+    live._plot_origami_analysis(payload)
+    assert live.origami_last_rendered_plot_option == 'Origami type counts'
+    assert not queued
+    live.origami_plot_option.set('Aligned density')
+    live.render_origami_plot()
+    assert len(queued) == 1

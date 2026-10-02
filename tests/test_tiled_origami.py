@@ -134,6 +134,9 @@ class TiledOrigamiTests(unittest.TestCase):
         app._refresh_origami_action_states = mock.Mock()
         app.status = variable("")
         app._run_worker = mock.Mock()
+        app._choose_tile_checkpoint_destination = mock.Mock(return_value=Path('/tmp/checkpoint-test'))
+        app._capture_origami_analysis = mock.Mock(return_value={})
+        app._checkpointed_tiled_worker = mock.Mock(return_value=("ignored", {}))
 
         app.analyze_tiled_origamis(use_tile_limit=True)
 
@@ -144,7 +147,7 @@ class TiledOrigamiTests(unittest.TestCase):
         limited_task = app._run_worker.call_args.args[0]
         app._tiled_origami_worker = mock.Mock(return_value=("ignored", {}))
         limited_task()
-        limited_indices = app._tiled_origami_worker.call_args.args[3]
+        limited_indices = app._checkpointed_tiled_worker.call_args.args[1]["context"]["tile_indices"]
         np.testing.assert_array_equal(limited_indices, np.asarray([1]))
 
         app.origami_identification_running = False
@@ -155,7 +158,7 @@ class TiledOrigamiTests(unittest.TestCase):
         app._run_worker.assert_called_once()
         whole_image_task = app._run_worker.call_args.args[0]
         whole_image_task()
-        whole_image_indices = app._tiled_origami_worker.call_args.args[3]
+        whole_image_indices = app._checkpointed_tiled_worker.call_args.args[1]["context"]["tile_indices"]
         np.testing.assert_array_equal(whole_image_indices, np.asarray([0, 1]))
         self.assertEqual(app._validated_origami_tile_context.call_count, 2)
 
