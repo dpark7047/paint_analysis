@@ -4472,7 +4472,7 @@ class PaintAnalysisApp(tk.Tk):
             lambda event: self.origami_settings_canvas.itemconfigure(settings_window, width=event.width),
         )
 
-        def scroll_origami_settings(event: tk.Event) -> None:
+        def scroll_origami_settings(event: tk.Event) -> str | None:
             if getattr(event, "num", None) == 4:
                 units = -1
             elif getattr(event, "num", None) == 5:
@@ -4482,6 +4482,7 @@ class PaintAnalysisApp(tk.Tk):
                 units = -1 if delta > 0 else 1 if delta < 0 else 0
             if units:
                 self.origami_settings_canvas.yview_scroll(units, "units")
+                return "break"
 
         def bind_settings_scroll(widget: tk.Widget) -> None:
             widget.bind("<MouseWheel>", scroll_origami_settings, add="+")
@@ -5309,8 +5310,9 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_toolbar_frame.grid(row=3, column=0, sticky="ew")
         self.origami_toolbar = OrigamiToolbar(self.origami_canvas, self.origami_toolbar_frame, self)
 
-        for frame in self.origami_stage_frames.values():
-            bind_settings_scroll(frame)
+        # Include the canvas and content padding, where the pointer can land
+        # between controls. Consume the wheel here before plot/root bindings.
+        bind_settings_scroll(self.origami_settings_canvas)
         self._toggle_origami_advanced_sections()
         self._show_origami_stage("Source")
         self._refresh_origami_action_states()
@@ -5798,6 +5800,11 @@ class PaintAnalysisApp(tk.Tk):
 
     def _layout_origami_plot_header(self, event: tk.Event) -> None:
         compact = int(event.width) < 1050
+        # Height changes also emit Configure. Reapplying every grid placement
+        # during a canvas redraw needlessly restarts Tk's layout work.
+        if getattr(self, "origami_plot_header_compact", None) == compact:
+            return
+        self.origami_plot_header_compact = compact
         if compact:
             self.origami_sidebar_toggle_button.grid_configure(row=0, column=0, padx=(0, 6), pady=(0, 3))
             self.origami_view_label.grid_configure(row=0, column=1, padx=(0, 4), pady=(0, 3))
@@ -12361,6 +12368,11 @@ class PaintAnalysisApp(tk.Tk):
             vmin=0.0,
             vmax=1.0,
         )
+        # Diagnostic artists annotate this viewport; they must never resize
+        # it. In Matplotlib 3.11 add_collection also autoscales view limits,
+        # which otherwise starts another footprint/zoom refresh on each draw.
+        axis.set_xlim(extent[0], extent[1])
+        axis.set_ylim(extent[2], extent[3])
         self.origami_source_density_artist = image
         axis.set_position(ORIGAMI_SOURCE_AXES_RECT)
         axis.set_anchor("C")
@@ -16179,7 +16191,7 @@ class PaintAnalysisApp(tk.Tk):
                 # of the group order in the uploaded schema.
                 zorder=6.0 if color == "#ff3030" else 5.8,
             )
-            axis.add_collection(collection)
+            axis.add_collection(collection, autolim=False)
             collection.set_in_layout(False)
             artists.append(collection)
         return artists

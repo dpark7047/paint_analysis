@@ -42,6 +42,13 @@ Step 3 now reports site-gap, alignment-gate and digital-group work after the
 site loop instead of displaying 100% before those operations finish.
 Windows symbolic-template filename parsing also terminates safely.
 
+Step 3 ON/OFF overlays no longer autoscale the source viewport. Matplotlib
+3.11 changed collection autoscaling, which could repeatedly schedule overlay
+and zoom-render work after calculation had already finished. Diagnostic artists
+now preserve the selected view, while user pan/zoom continues to refresh it.
+The plot header only reflows when its layout changes, and sidebar wheel scrolling
+also works over its canvas and padding.
+
 For a fresh Windows environment (Python 3.12 recommended):
 
 ```powershell
@@ -62,6 +69,15 @@ $env:PAINT_ANALYSIS_HOME = "$PWD/.gpu-state"
 $env:PAINT_REQUIRE_GPU_TESTS = "1"
 .\.gpu-venv\Scripts\python.exe -B benchmark_classification.py
 .\.gpu-venv\Scripts\python.exe -B -m pytest tests -q
+```
+
+An optional Windows UI regression uses a transparent maximized window and 500
+synthetic ON/OFF footprints to check viewport stability, wheel scrolling, and
+reaching the Step 4 button. It does not run classification or open data files:
+
+```powershell
+$env:PAINT_TEST_WINDOWS_GUI = "1"
+.\.gpu-venv\Scripts\python.exe -B -m pytest tests/test_classification_display_windows.py -q
 ```
 
 The benchmark opens no user datasets and writes only synthetic results to
