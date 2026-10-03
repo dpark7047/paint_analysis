@@ -1,5 +1,78 @@
 # DNA PAINT Picasso-Style ROI Analyzer
 
+## Experimental classification GPU branch
+
+This checkout is the `perf/classification-gpu` experiment. The original `main`
+working directory, original Python environment, and localization files are
+kept separate. On the test desktop, double-click **run_paint_gpu.bat** here.
+Use **run_paint_reference.bat** to compare the original numerical path using
+the same dependency versions. Run one app at a time for timing comparisons.
+The launchers use this checkout's `.gpu-venv` and `.gpu-state`; automatic
+development-session restoration is disabled. Existing export/save dialogs
+remain explicit user actions. Input files are read; acceleration does not
+write corrected coordinates back to the source file.
+
+The optional backend changes how existing operations run, retaining physical
+calibration, detection rules, fiducial support, pose/QC gates, digital-group
+brightness factors, and exact ON/OFF lookup. Step 1's large Gaussian/FFT maps
+and Step 3's bounded distance/group batches use CUDA when available. Site
+peak/boundary measurements are vectorized with matching CPU values. Fixed
+template trees and previously calculated centroids are reused. Step 2 pose
+selection stays on CPU: a GPU FFT prototype changed the selected orientation
+for symmetric templates, so it is excluded from this branch. Step 4 keeps
+its original classification decisions; Step 5 reuses the accelerated pipeline
+on each tile. Fast overlay benefits from the shared CPU improvements and large
+overlay filtering can use GPU. Picasso G5M fitting, RCC, and AIM are unchanged.
+
+Small image filters remain on CPU. `PAINT_CLASSIFICATION_COMPUTE` accepts
+`reference`, `cpu`, `auto`, or `gpu`; the GPU launcher defaults to `auto`.
+`auto` retries on CPU if CUDA initialization or a GPU operation fails.
+`gpu` reports an error instead of silently falling back, for verification.
+The pipeline remains mixed CPU/GPU even in `gpu` mode. Group measurements
+close to ON/OFF support or prominence thresholds are rechecked on CPU.
+Floating-point results are tested with tolerances; exact candidate membership,
+site counts and final class assignments are checked in the synthetic benchmark.
+Real experimental results still need the user's comparison.
+
+Long jobs record worker/UI stack traces every 30 seconds in
+`.gpu-state/classification-timing.jsonl`, alongside stage timings and backend
+operation counts. Queue polling yields periodically to Tk, and full-field
+contrast preparation is cached and moved out of Tk for classification results.
+Step 3 now reports site-gap, alignment-gate and digital-group work after the
+site loop instead of displaying 100% before those operations finish.
+Windows symbolic-template filename parsing also terminates safely.
+
+For a fresh Windows environment (Python 3.12 recommended):
+
+```powershell
+python -m venv .gpu-venv
+.\.gpu-venv\Scripts\python.exe -m pip install -r requirements-gpu.txt pytest
+```
+
+The test desktop uses the original app's dependency versions in its independent
+environment. Its version snapshot is in `.gpu-state/baseline-dependencies.txt`.
+`requirements-gpu.txt` is optional; normal Mac/CPU launches need no CuPy.
+
+To repeat the synthetic-only benchmark and regression checks:
+
+```powershell
+$env:CUPY_CACHE_DIR = "$PWD/.gpu-state/cupy"
+$env:NUMBA_CACHE_DIR = "$PWD/.gpu-state/numba"
+$env:PAINT_ANALYSIS_HOME = "$PWD/.gpu-state"
+$env:PAINT_REQUIRE_GPU_TESTS = "1"
+.\.gpu-venv\Scripts\python.exe -B benchmark_classification.py
+.\.gpu-venv\Scripts\python.exe -B -m pytest tests -q
+```
+
+The benchmark opens no user datasets and writes only synthetic results to
+`.gpu-results/benchmark.json`. It excludes GPU warm-up from timings and compares
+reference/optimized CPU/forced GPU/automatic modes. Results depend on dataset
+size and machine load. One original regression,
+`test_rotated_origamis_preserve_a_shared_missing_site`, also fails in the
+untouched original checkout with this desktop's Picasso 0.11.1 (8 high-occupancy
+sites versus the test's expected minimum 10). Its scientific behavior and
+assertion are retained for comparison.
+
 This GUI is now map-first:
 
 1. Load a Picasso `.h5`/`.hdf5` file or a localization `.csv` file.

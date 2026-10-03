@@ -32,3 +32,8 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+
+# Isolated GPU experiment environment, diagnostics and benchmark output.
+.gpu-venv/
+.gpu-state/
+.gpu-results/

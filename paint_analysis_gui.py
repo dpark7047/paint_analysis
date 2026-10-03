@@ -12,6 +12,7 @@ import tempfile
 import traceback
 import gc
 import uuid
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -39,6 +40,8 @@ from matplotlib.widgets import RectangleSelector
 
 from analysis_session import save_analysis_session, load_analysis_session
 from tile_checkpoint import TileCheckpoint, checkpoint_lock, load_checkpoint_run, validate_checkpoint_run
+import classification_compute as compute
+from origami_analysis import iter_sparse_site_evidence
 from tiled_aggregation import StreamingTileResults, SEQUENCE_PARAMS
 
 from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
@@ -1036,10 +1039,18 @@ def custom_template_display_name(
         embedded_name = metadata.get("display_name", metadata.get("name"))
         if isinstance(embedded_name, str) and embedded_name.strip():
             return embedded_name.strip()
-    name = Path(path).stem
+    # A Mac symbolic filename may contain a literal backslash. Windows Path
+    # interprets it as a directory separator, leaving '.png' as the filename;
+    # Path('.png').stem is still '.png', so the old suffix loop never ended.
+    raw_path = str(path)
+    name = raw_path.rsplit("/", 1)[-1] if "/" in raw_path else Path(path).name
     image_suffixes = (".png", ".tif", ".tiff", ".jpg", ".jpeg")
-    while any(name.lower().endswith(suffix) for suffix in image_suffixes):
-        name = Path(name).stem
+    while True:
+        suffix = next((suffix for suffix in image_suffixes
+                       if name.lower().endswith(suffix) and len(name) > len(suffix)), None)
+        if suffix is None:
+            break
+        name = name[:-len(suffix)]
     if name == ":":
         return "/"
     if name in {":\\", "\\"}:
@@ -8245,6 +8256,7 @@ class PaintAnalysisApp(tk.Tk):
         accepted &= required_fiducial_mask(picks, params)
         return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, accepted)
 
+    @compute.timed
     def _remeasure_origami_sites(
         self,
         picks: OrigamiPickResult,
@@ -8290,12 +8302,11 @@ class PaintAnalysisApp(tk.Tk):
         supported_columns = np.zeros(candidate_count, dtype=int)
         spacing_rms = np.full(candidate_count, float("inf"))
         spacing_max = np.full(candidate_count, float("inf"))
-        for index, region in enumerate(picks.aligned_regions):
-            evidence = sparse_site_evidence_diagnostics(
-                region,
-                full_grid,
-                site_radius_nm=radius_nm,
-            )
+        measured_sites = iter_sparse_site_evidence(
+            picks.aligned_regions, full_grid, site_radius_nm=radius_nm,
+        )
+        for index, evidence in enumerate(measured_sites):
+            region = picks.aligned_regions[index]
             lattice_count[index] = evidence.counts
             lattice_prominence[index] = evidence.prominence
             supported_full = (
@@ -8327,12 +8338,14 @@ class PaintAnalysisApp(tk.Tk):
                 template_grid,
                 supported,
                 site_radius_nm=radius_nm,
+                centroids=centroids[index],
             )
             if index + 1 == candidate_count or (index + 1) % max(1, candidate_count // 30) == 0:
                 progress_callback(
-                    100.0 * (index + 1) / max(candidate_count, 1),
+                    80.0 * (index + 1) / max(candidate_count, 1),
                     f"Digital-pixel site detection: {index + 1:,}/{candidate_count:,} candidates...",
                 )
+        progress_callback(82.0, "Measuring site-gap contrast...")
         gap_contrast, on_site_fraction, _area = site_gap_contrast_for_regions(
             picks.aligned_regions,
             template_grid,
@@ -8340,11 +8353,14 @@ class PaintAnalysisApp(tk.Tk):
             rectangle_height_nm=float(picks.rectangle_height_nm),
             site_radius_nm=radius_nm,
         )
+        progress_callback(88.0, "Checking alignment support and footprint overlap...")
         picks = PaintAnalysisApp._apply_origami_alignment_filters(picks, params)
         params["_alignment_accepted_mask"] = tuple(
             bool(value) for value in np.asarray(picks.accepted_mask, dtype=bool)
         )
+        progress_callback(92.0, "Measuring digital-group localization evidence...")
         self._measure_direct_digital_groups(picks, params)
+        progress_callback(100.0, "Digital-pixel measurements complete.")
         return replace(
             picks,
             accepted_mask=picks.accepted_mask.copy(),
@@ -8372,6 +8388,7 @@ class PaintAnalysisApp(tk.Tk):
         )
 
     @staticmethod
+    @compute.timed
     def _measure_direct_digital_groups(
         picks: OrigamiPickResult,
         params: dict[str, Any],
@@ -8411,6 +8428,29 @@ class PaintAnalysisApp(tk.Tk):
                 group_cells,
             )
         )
+        # CUDA reductions can differ by a few final bits. Recheck candidates
+        # close to an ON/OFF gate with the reference CPU measurement; changing
+        # the visible support/prominence threshold is never an optimization.
+        if compute.mode() in {"gpu", "auto"} and compute.status()["gpu_initialized"]:
+            support_gate = float(params.get("min_site_localizations", 0))
+            prominence_gate = float(params.get("min_site_evidence", 0.0))
+            near_gate = np.zeros(len(group_evidence), dtype=bool)
+            if support_gate > 0:
+                near_gate |= np.any(np.abs(group_evidence - support_gate) <= 1e-8 * max(1., support_gate), axis=1)
+            if prominence_gate > 0:
+                raw_prominence = np.maximum(0., 2. * raw_group_probability - 1.)
+                near_gate |= np.any(np.abs(raw_prominence - prominence_gate) <= 1e-8, axis=1)
+            if np.any(near_gate):
+                with compute.use_mode("reference"):
+                    group_evidence[near_gate] = direct_digital_group_localization_evidence(
+                        [picks.aligned_regions[index] for index in np.flatnonzero(near_gate)],
+                        full_grid, group_cells,
+                        assignment_radius_nm=float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
+                        brightness_factors=digital_model.get("bit_brightness_factors"),
+                    )
+                _raw_posterior, _raw_log_bayes, raw_group_probability, _raw_correlation = digital_group_template_evidence(
+                    group_evidence, np.zeros(len(digital_model["bit_ids"]), dtype=bool), group_cells,
+                )
         _posterior, _log_bayes, group_probability, _correlation = (
             digital_group_template_evidence(
                 group_evidence,
@@ -8472,6 +8512,7 @@ class PaintAnalysisApp(tk.Tk):
         accepted &= required_fiducial_mask(picks, params)
         return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, np.asarray(accepted, dtype=bool))
 
+    @compute.timed
     def _identify_origami_worker(
         self,
         points_nm: np.ndarray,
@@ -9521,6 +9562,7 @@ class PaintAnalysisApp(tk.Tk):
         self._remember_file_dialog_dir(directory)
         return directory
 
+    @compute.timed
     def _checkpointed_tiled_worker(self, directory, run, *, initialize=False, completed_only=False):
         with checkpoint_lock(directory):
             if initialize:
@@ -10285,6 +10327,7 @@ class PaintAnalysisApp(tk.Tk):
             )
         )
 
+    @compute.timed
     def _overlay_origami_worker(
         self,
         accepted_regions: list[np.ndarray],
@@ -10955,11 +10998,24 @@ class PaintAnalysisApp(tk.Tk):
         self.active_worker_count = self.__dict__.get("active_worker_count", 0) + 1
 
         def target() -> None:
+            stop_watchdog = threading.Event()
+            if os.environ.get("PAINT_CLASSIFICATION_LOG"):
+                threading.Thread(target=compute.worker_watchdog,
+                                 args=(stop_watchdog, getattr(func, "__name__", "worker")),
+                                 daemon=True).start()
             try:
-                self.worker_queue.put(("result", func()))
+                result = func()
+                if result[0] in {"origami_stage_preview", "origami_picks", "origami_multi_template", "origami_tiled"}:
+                    cached_render = getattr(self, "origami_source_render_result", None)
+                    if cached_render is not None:
+                        # Preparing a full-field image can be expensive; Tk only
+                        # attaches the finished contrast image to its canvas.
+                        PaintAnalysisApp._prepare_origami_display_contrast(cached_render)
+                self.worker_queue.put(("result", result))
             except Exception as exc:
                 self.worker_queue.put(("error", (exc, traceback.format_exc())))
             finally:
+                stop_watchdog.set()
                 self.worker_queue.put(("worker_done", None))
 
         threading.Thread(target=target, daemon=True).start()
@@ -10968,8 +11024,9 @@ class PaintAnalysisApp(tk.Tk):
         self.worker_queue.put(("status", message))
 
     def _poll_worker(self) -> None:
+        poll_deadline = time.monotonic() + 0.04
         try:
-            while True:
+            while time.monotonic() < poll_deadline:
                 kind, payload = self.worker_queue.get_nowait()
                 if kind == "worker_done":
                     self.active_worker_count = max(0, self.__dict__.get("active_worker_count", 0) - 1)
@@ -12248,6 +12305,19 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_canvas.draw_idle()
         self.notebook.select(TEMPORAL_TAB)
 
+    @staticmethod
+    def _prepare_origami_display_contrast(cached_render):
+        key = (id(cached_render["image"]), float(cached_render["min_density"]),
+               float(cached_render["max_density"]))
+        if cached_render.get("_display_contrast_key") != key:
+            contrast, limits = scale_density_like_picasso(
+                np.asarray(cached_render["image"], dtype=float), key[1], key[2],
+            )
+            cached_render["_display_contrast"] = contrast
+            cached_render["_display_density_limits"] = limits
+            cached_render["_display_contrast_key"] = key
+        return cached_render["_display_contrast"], cached_render["_display_density_limits"]
+
     def _draw_origami_source_density(
         self,
         axis: Any,
@@ -12257,15 +12327,10 @@ class PaintAnalysisApp(tk.Tk):
     ) -> dict[str, object]:
         cached_render = self.origami_source_render_result if render_result is None else render_result
         if cached_render is not None:
-            raw_image = np.asarray(cached_render["image"], dtype=float)
-            contrast, density_limits = scale_density_like_picasso(
-                raw_image,
-                float(cached_render["min_density"]),
-                float(cached_render["max_density"]),
-            )
+            contrast, density_limits = PaintAnalysisApp._prepare_origami_display_contrast(cached_render)
             extent = tuple(float(value) for value in cached_render["extent"])
-            pixel_x = (extent[1] - extent[0]) / max(1, raw_image.shape[1])
-            pixel_y = (extent[3] - extent[2]) / max(1, raw_image.shape[0])
+            pixel_x = (extent[1] - extent[0]) / max(1, contrast.shape[1])
+            pixel_y = (extent[3] - extent[2]) / max(1, contrast.shape[0])
             preview: dict[str, object] = {
                 "contrast": contrast,
                 "extent": extent,

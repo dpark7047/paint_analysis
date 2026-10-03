@@ -17,6 +17,12 @@ from scipy.sparse.csgraph import connected_components
 from scipy.special import logsumexp
 from scipy.spatial import cKDTree
 
+import classification_compute as compute
+
+# Only origami calculations use these adapters. Picasso drift is untouched.
+gaussian_filter = compute.gaussian_filter
+fftconvolve = compute.fftconvolve
+
 
 @dataclass
 class OrigamiAnalysisResult:
@@ -345,7 +351,7 @@ def lattice_template_probability_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -492,7 +498,7 @@ def lattice_count_template_probability_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -716,6 +722,7 @@ def logical_bit_template_evidence(
     return posterior, log_bayes_factor, bit_probability, pattern_correlation
 
 
+@compute.timed
 def direct_digital_group_localization_evidence(
     aligned_regions: Sequence[np.ndarray],
     lattice_points_nm: np.ndarray,
@@ -760,6 +767,9 @@ def direct_digital_group_localization_evidence(
         raise ValueError("Brightness factors must contain one positive finite value per digital group.")
 
     evidence = np.zeros((len(aligned_regions), len(groups)), dtype=float)
+    accelerated = compute.group_evidence(aligned_regions, grid, groups, radius, factors)
+    if accelerated is not None:
+        return accelerated
     group_trees = [cKDTree(grid[cells]) for cells in groups]
     radius_squared = radius * radius
     for region_index, region_value in enumerate(aligned_regions):
@@ -997,7 +1007,7 @@ def lattice_template_on_site_fractions(
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
 
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -1037,7 +1047,7 @@ def detected_lattice_template_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -1189,7 +1199,7 @@ def monte_carlo_template_evidence(
         raise ValueError("Lattice-site evidence must have one column per lattice cell.")
     full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
     template = np.asarray(template_points_nm, dtype=float)
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -1274,7 +1284,7 @@ def lattice_template_empty_cell_fractions(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -1911,6 +1921,7 @@ def cluster_aligned_origami_sites(
     return counts, display_labels, center_array, np.asarray(site_indices, dtype=int)
 
 
+@compute.timed
 def density_map_for_origami_picking(
     points_nm: np.ndarray,
     bin_size_nm: float,
@@ -2310,6 +2321,7 @@ def _pick_origami_regions(
     return regions, density, contrast, extent, component_labels
 
 
+@compute.timed
 def pick_origami_candidates(
     points_nm: np.ndarray,
     *,
@@ -2552,7 +2564,7 @@ def alignment_corner_sites(template_points_nm):
         return np.empty((0, 2), dtype=float)
     low, high = sites.min(axis=0), sites.max(axis=0)
     corners = np.asarray([low, [high[0], low[1]], high, [low[0], high[1]]])
-    indices = np.unique(cKDTree(sites).query(corners)[1])
+    indices = np.unique(compute.template_tree(sites).query(corners)[1])
     return sites[indices]
 
 
@@ -2819,13 +2831,13 @@ def site_gap_contrast_for_regions(
     sample_y = np.linspace(y_lower, y_upper, sample_count)
     sample_xx, sample_yy = np.meshgrid(sample_x, sample_y)
     sample_points = np.column_stack((sample_xx.ravel(), sample_yy.ravel()))
-    sample_distances, _sample_sites = cKDTree(grid).query(sample_points, k=1)
+    sample_distances, _sample_sites = compute.template_tree(grid).query(sample_points, k=1)
     site_area_fraction = float(np.mean(sample_distances <= site_radius_nm))
     site_area_fraction = float(np.clip(site_area_fraction, 1e-6, 1.0 - 1e-6))
 
     contrasts = np.zeros(len(aligned_regions), dtype=float)
     on_site_fractions = np.zeros(len(aligned_regions), dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     for index, region in enumerate(aligned_regions):
         points = np.asarray(region, dtype=float)
         if not len(points):
@@ -2845,6 +2857,7 @@ def sparse_site_evidence_diagnostics(
     grid_points_nm: np.ndarray,
     *,
     site_radius_nm: float,
+    _assignments: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> SparseSiteEvidenceResult:
     """Return per-site support measurements and prominence-sampling geometry.
 
@@ -2871,13 +2884,25 @@ def sparse_site_evidence_diagnostics(
             boundary_reference_positions_nm=np.full((len(grid), 2), np.nan, dtype=float),
             boundary_points_nm=np.full((len(grid), 32, 2), np.nan, dtype=float),
         )
-    distances = np.linalg.norm(points[:, None, :] - grid[None, :, :], axis=2)
-    nearest_sites = np.argmin(distances, axis=1)
-    nearest_distances = distances[np.arange(len(points)), nearest_sites]
+    if compute.mode() == "reference":
+        distances = np.linalg.norm(points[:, None, :] - grid[None, :, :], axis=2)
+        nearest_sites = np.argmin(distances, axis=1)
+        nearest_distances = distances[np.arange(len(points)), nearest_sites]
+    elif _assignments is not None:
+        nearest_distances, nearest_sites = _assignments
+    else:
+        nearest_distances, nearest_sites = compute.nearest_assignments(points, grid, use_gpu=False)
+    if compute.mode() != "reference":
+        # Preserve the original inclusive radius comparison at its boundary.
+        borderline = np.abs(nearest_distances - site_radius_nm) <= 1e-12
+        if np.any(borderline):
+            nearest_distances[borderline] = np.linalg.norm(
+                points[borderline] - grid[nearest_sites[borderline]], axis=1
+            )
     assigned_sites = nearest_sites[nearest_distances <= site_radius_nm]
     on_counts = np.bincount(assigned_sites, minlength=len(grid)).astype(int)
     if len(grid) > 1:
-        nearest_spacing = cKDTree(grid).query(grid, k=2)[0][:, 1]
+        nearest_spacing = compute.template_tree(grid).query(grid, k=2)[0][:, 1]
         typical_spacing = float(np.median(nearest_spacing))
     else:
         typical_spacing = max(2.0 * site_radius_nm, 1.0)
@@ -2916,7 +2941,14 @@ def sparse_site_evidence_diagnostics(
         mode="constant",
     )
 
-    for site_index, site in enumerate(grid):
+    if compute.mode() != "reference":
+        (prominence, peak_positions, peak_densities, boundary_densities,
+         boundary_reference_densities, boundary_reference_positions,
+         boundary_points) = compute.peak_diagnostics(
+            density, x_centers, y_centers, grid, on_counts, nearest_spacing,
+            site_radius_nm, bandwidth_nm, x_min, y_min, effective_x_nm, effective_y_nm,
+        )
+    for site_index, site in enumerate(grid) if compute.mode() == "reference" else ():
         if on_counts[site_index] == 0:
             continue
         search_radius = min(site_radius_nm, 0.40 * float(nearest_spacing[site_index]))
@@ -2976,6 +3008,33 @@ def sparse_site_evidence_diagnostics(
     )
 
 
+def iter_sparse_site_evidence(regions, grid, *, site_radius_nm):
+    """Stream Step 3 diagnostics, sharing bounded GPU assignment batches."""
+    if compute.mode() in {"reference", "cpu"} or compute.gpu_module() is None:
+        for region in regions:
+            yield sparse_site_evidence_diagnostics(region, grid, site_radius_nm=site_radius_nm)
+        return
+    start = 0
+    while start < len(regions):
+        stop = start + 1
+        point_count = len(regions[start])
+        while stop < len(regions) and stop - start < 32 and point_count + len(regions[stop]) <= 65536:
+            point_count += len(regions[stop])
+            stop += 1
+        batch = regions[start:stop]
+        points = np.concatenate(batch) if len(batch) > 1 else np.asarray(batch[0])
+        distances, indices = compute.nearest_assignments(points, grid)
+        offset = 0
+        for region in batch:
+            end = offset + len(region)
+            yield sparse_site_evidence_diagnostics(
+                region, grid, site_radius_nm=site_radius_nm,
+                _assignments=(distances[offset:end], indices[offset:end]),
+            )
+            offset = end
+        start = stop
+
+
 def sparse_site_evidence(
     aligned_region: np.ndarray,
     grid_points_nm: np.ndarray,
@@ -3014,14 +3073,16 @@ def supported_site_spacing_errors(
     supported_sites: np.ndarray,
     *,
     site_radius_nm: float,
+    centroids: np.ndarray | None = None,
 ) -> tuple[float, float]:
     """Return RMS and maximum pairwise spacing errors for supported site centroids."""
-    centroids = supported_site_centroids(
-        aligned_region,
-        grid_points_nm,
-        supported_sites,
-        site_radius_nm=site_radius_nm,
-    )
+    if centroids is None:
+        centroids = supported_site_centroids(
+            aligned_region,
+            grid_points_nm,
+            supported_sites,
+            site_radius_nm=site_radius_nm,
+        )
     retained_indices = np.flatnonzero(np.all(np.isfinite(centroids), axis=1))
     if len(retained_indices) < 2:
         return float("inf"), float("inf")
@@ -3051,7 +3112,7 @@ def supported_site_centroids(
     supported_indices = np.flatnonzero(supported)
     if not len(supported_indices) or not len(points):
         return centroids
-    distances, nearest_sites = cKDTree(grid).query(points, k=1)
+    distances, nearest_sites = compute.template_tree(grid).query(points, k=1)
     for site_index in supported_indices:
         assigned = points[(nearest_sites == site_index) & (distances <= site_radius_nm)]
         if not len(assigned):
@@ -3116,7 +3177,7 @@ def grid_vs_blob_delta_bic(
     )
     observation = image.T.ravel().astype(float)
     if len(grid) > 1:
-        nearest_grid_spacing = float(np.median(cKDTree(grid).query(grid, k=2)[0][:, 1]))
+        nearest_grid_spacing = float(np.median(compute.template_tree(grid).query(grid, k=2)[0][:, 1]))
     else:
         nearest_grid_spacing = max(rectangle_width_nm, rectangle_height_nm)
     minimum_sigma = max(1.5, 0.75 * pixel_nm)
@@ -3446,7 +3507,7 @@ def _sparse_pose_quality(
     grid = np.asarray(grid_points_nm, dtype=float)
     if not len(points) or not len(grid):
         return -1.0
-    distances, sites = cKDTree(grid).query(points, k=1)
+    distances, sites = compute.template_tree(grid).query(points, k=1)
     counts = np.bincount(
         sites[distances <= site_radius_nm], minlength=len(grid)
     ).astype(float)
@@ -3550,7 +3611,7 @@ def alignment_fiducial_support(points, sites, radius_nm, minimum_localizations):
     counts = np.zeros(len(sites), dtype=int)
     residuals = np.full(len(sites), np.inf)
     if len(points) and len(sites):
-        distances, nearest = cKDTree(sites).query(points)
+        distances, nearest = compute.template_tree(sites).query(points)
         for index in range(len(sites)):
             local = distances[(nearest == index) & (distances <= radius_nm)]
             counts[index] = len(local)
@@ -3588,7 +3649,7 @@ def _refine_sparse_grid_pose(
     refined = original.copy()
     accumulated_rotation = np.eye(2, dtype=float)
     accumulated_offset = np.zeros(2, dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     for _iteration in range(max(0, int(iterations))):
         distances, sites = grid_tree.query(refined, k=1)
         observed_centroids: list[np.ndarray] = []
@@ -3835,7 +3896,7 @@ def _refine_pose_from_lattice_centroids(
     refined = original.copy()
     accumulated_rotation = np.eye(2, dtype=float)
     accumulated_offset = np.zeros(2, dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     retained_count = 0
     retained_rms = float("inf")
     for _iteration in range(max(0, int(iterations))):
@@ -3902,6 +3963,8 @@ def _refine_pose_from_lattice_centroids(
     return accumulated_rotation, accumulated_offset, retained_count, retained_rms
 
 
+@compute.timed
+@compute.cpu_only
 def _align_regions_by_image_correlation(
     regions: list[np.ndarray],
     *,
@@ -4354,6 +4417,7 @@ def fitted_footprint_overlap_fractions(
     return result
 
 
+@compute.timed
 def identify_origami_regions(
     points_nm: np.ndarray,
     *,
@@ -4526,7 +4590,7 @@ def identify_origami_regions(
             )
         else:
             grid = full_grid
-        template_grid_distances, template_lattice_indices = cKDTree(full_grid).query(grid, k=1)
+        template_grid_distances, template_lattice_indices = compute.template_tree(full_grid).query(grid, k=1)
         template_mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
         if np.any(template_grid_distances > template_mapping_tolerance_nm):
             raise ValueError("The alignment template does not map onto the configured lattice.")
@@ -4801,6 +4865,7 @@ def identify_origami_regions(
     return result
 
 
+@compute.timed
 def align_picked_origamis(
     picked_regions: list[np.ndarray],
     *,
@@ -4917,7 +4982,7 @@ def align_picked_origamis(
                 site_match_radius_nm=site_radius_nm,
             )
         else:
-            distances, nearest_sites = cKDTree(grid).query(aligned, k=1)
+            distances, nearest_sites = compute.template_tree(grid).query(aligned, k=1)
             supported_sites = supported_grid_site_mask(
                 aligned,
                 grid,
