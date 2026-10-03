@@ -108,6 +108,12 @@ def test_single_template_resume_skips_completed_detection(tmp_path, monkeypatch)
     detect = Mock(return_value=deepcopy(picks))
     monkeypatch.setattr(gui, 'identify_origami_regions', detect)
     monkeypatch.setattr(gui, 'align_picked_origamis', Mock(return_value=object()))
+    _, preview = live._checkpointed_tiled_worker(tmp_path, run, completed_only=True)
+    detect.assert_not_called()
+    expected = sum(bool(accepted) and np.median(region[:, 0]) < 1800.
+                   for region, accepted in zip(picks.regions, picks.accepted_mask))
+    assert preview['picks'].accepted_count == expected
+    assert preview['identification_params']['_checkpoint_preview'] == {'completed': 1, 'planned': 2}
     kind, result = live._checkpointed_tiled_worker(tmp_path, load_checkpoint_run(tmp_path, live._analysis_record_types()))
     assert kind == 'origami_tiled'
     detect.assert_called_once()
@@ -133,3 +139,119 @@ def test_resume_restores_saved_configuration_and_rebases_generation(tmp_path):
     assert restored.origami_checkpoint_location.get() == str(tmp_path)
     restored._run_worker.call_args.args[0]()
     restored._checkpointed_tiled_worker.assert_called_once_with(tmp_path, run)
+
+
+def test_load_analysis_recognizes_recovery_snapshot_and_routes_to_resume(tmp_path):
+    live, run, _ = run_fixture()
+    path = tmp_path / 'run.paintanalysis'
+    save_analysis_session(path, run)
+    restored = app()
+    recovered = restored._read_origami_analysis_file(path, restored._analysis_record_types())
+    assert recovered['run_id'] == run['run_id']
+    restored._resume_tiled_checkpoint = Mock()
+    restored._choose_checkpoint_load_action = Mock(return_value="resume")
+    restored._install_origami_analysis = Mock()
+    dialog = Mock()
+    restored._analysis_io_dialog = dialog
+    restored.analysis_io_busy = True
+    restored._complete_origami_analysis_io(path, True, recovered, None)
+    assert not restored.analysis_io_busy
+    dialog.destroy.assert_called_once()
+    restored._resume_tiled_checkpoint.assert_called_once_with(tmp_path, recovered)
+    restored._install_origami_analysis.assert_not_called()
+    assert 'Resuming tiled analysis' in restored.status.get()
+
+
+def test_regular_analysis_load_still_validates_and_single_tile_explains_recovery(tmp_path):
+    live, run, _ = run_fixture()
+    normal = tmp_path / 'normal.paintanalysis'
+    save_analysis_session(normal, run['analysis'])
+    restored = app()
+    analysis = restored._read_origami_analysis_file(normal, restored._analysis_record_types())
+    assert 'state' in analysis and 'settings' in analysis
+    tile = TileCheckpoint(tmp_path, run['run_id'], restored._analysis_record_types())
+    tile.save(0, (0, 1, 0, 1), 'single', {})
+    with pytest.raises(ValueError, match='Open run.paintanalysis'):
+        restored._read_origami_analysis_file(tile.path(0), restored._analysis_record_types())
+
+
+def test_preview_uses_only_completed_tiles_without_writing_or_processing(tmp_path, monkeypatch):
+    live, run, payload = run_fixture()
+    live._identify_origami_worker = Mock(side_effect=[('origami_multi_picks', deepcopy(payload)), RuntimeError('interrupted')])
+    with pytest.raises(RuntimeError):
+        live._checkpointed_tiled_worker(tmp_path, run, initialize=True)
+    before = {path.name: path.read_bytes() for path in tmp_path.glob('*.paintanalysis')}
+    live._identify_origami_worker = Mock(side_effect=AssertionError('Preview ran an unfinished tile'))
+    with monkeypatch.context() as patch:
+        patch.setattr(TileCheckpoint, 'save', Mock(side_effect=AssertionError('Preview wrote a tile')))
+        kind, partial = live._checkpointed_tiled_worker(tmp_path, run, completed_only=True)
+    assert kind == 'origami_multi_picks'
+    np.testing.assert_array_equal(partial['counts'], [12, 12])
+    assert partial['unclassified_count'] == 12
+    assert partial['candidate_count'] == 36
+    assert partial['points_nm'][:, 0].max() < 1800.
+    assert partial['params']['_checkpoint_preview'] == {'completed': 1, 'planned': 2}
+    assert all(item['params']['_checkpoint_preview']['completed'] == 1 for item in partial['templates'])
+    assert before == {path.name: path.read_bytes() for path in tmp_path.glob('*.paintanalysis')}
+    # Resuming after inspection still runs only the unfinished tile.
+    live._identify_origami_worker = Mock(return_value=('origami_multi_picks', deepcopy(payload)))
+    _, completed = live._checkpointed_tiled_worker(tmp_path, run)
+    live._identify_origami_worker.assert_called_once()
+    np.testing.assert_array_equal(completed['counts'], [24, 24])
+    assert '_checkpoint_preview' not in completed['params']
+
+
+def test_preview_graphs_keep_partial_label_after_save_and_load(tmp_path):
+    live, run, _ = run_fixture()
+    for entry in live.origami_multi_template_results.values():
+        entry['params']['_checkpoint_preview'] = {'completed': 1, 'planned': 5}
+    live.origami_template_result_view.set('All templates')
+    live.origami_plot_option.set('Origami type counts')
+    live.render_origami_plot()
+    labels = [text for text in live.origami_figure.texts if text.get_gid() == 'checkpoint-preview']
+    assert len(labels) == 1
+    assert labels[0].get_text() == 'PARTIAL ANALYSIS — 1/5 tiles'
+    live.origami_show_legends.set(False)
+    live._toggle_origami_legends()
+    assert len([t for t in live.origami_figure.texts if t.get_gid() == 'checkpoint-preview']) == 1
+    path = tmp_path / 'partial.paintanalysis'
+    save_analysis_session(path, live._capture_origami_analysis())
+    restored = app()
+    restored._install_origami_analysis(restored._read_origami_analysis_file(path, restored._analysis_record_types()))
+    assert any(t.get_text() == 'PARTIAL ANALYSIS — 1/5 tiles' for t in restored.origami_figure.texts)
+
+
+def test_preview_with_no_completed_tiles_does_not_start_detection(tmp_path):
+    live, run, _ = run_fixture()
+    live._identify_origami_worker = Mock(side_effect=AssertionError('Unexpected tile processing'))
+    with pytest.raises(ValueError, match='No completed nonempty tile'):
+        live._checkpointed_tiled_worker(tmp_path, run, completed_only=True)
+    live._identify_origami_worker.assert_not_called()
+
+
+def test_load_checkpoint_preview_choice_routes_without_resuming(tmp_path):
+    live, run, _ = run_fixture()
+    live._choose_checkpoint_load_action = Mock(return_value='preview')
+    live._resume_tiled_checkpoint = Mock()
+    live._complete_origami_analysis_io(tmp_path / 'run.paintanalysis', True, run, None)
+    live._resume_tiled_checkpoint.assert_called_once_with(tmp_path, run, preview_only=True)
+
+
+def test_aggregation_reuses_shared_arrays_and_maps_large_results(tmp_path):
+    from dataclasses import replace
+    from origami_analysis import concatenate_origami_pick_results
+    live, _, _ = run_fixture()
+    first = live.origami_pick_result
+    large = np.arange(200_000, dtype=float).reshape(1, -1)
+    left = replace(first, alignment_candidate_images=large)
+    right = replace(first, alignment_candidate_images=large.copy())
+    cache = {}
+    combined = concatenate_origami_pick_results([left, right], shared_arrays=cache, array_directory=tmp_path)
+    other = concatenate_origami_pick_results(
+        [replace(left, accepted_mask=~left.accepted_mask), replace(right, accepted_mask=~right.accepted_mask)],
+        shared_arrays=cache, array_directory=tmp_path)
+    assert isinstance(combined.alignment_candidate_images, np.memmap)
+    assert combined.alignment_candidate_images is other.alignment_candidate_images
+    assert combined.point_counts is other.point_counts
+    assert not np.array_equal(combined.accepted_mask, other.accepted_mask)
+    np.testing.assert_array_equal(combined.alignment_candidate_images, np.concatenate([large, large]))

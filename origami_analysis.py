@@ -125,7 +125,7 @@ class SparseSiteEvidenceResult:
     boundary_points_nm: np.ndarray
 
 
-def concatenate_origami_pick_results(results: list[OrigamiPickResult]) -> OrigamiPickResult:
+def concatenate_origami_pick_results(results: list[OrigamiPickResult], *, shared_arrays=None, array_directory=None) -> OrigamiPickResult:
     """Combine same-template tile results into one world-coordinate pick result."""
     if not results:
         raise ValueError("At least one origami pick result is required.")
@@ -142,7 +142,30 @@ def concatenate_origami_pick_results(results: list[OrigamiPickResult]) -> Origam
     def concatenate(attribute: str, *, axis: int = 0) -> np.ndarray:
         arrays = [np.asarray(getattr(result, attribute)) for result in results]
         populated = [array for array in arrays if array.ndim > axis and array.shape[axis] > 0]
-        return np.concatenate(populated, axis=axis) if populated else arrays[0].copy()
+        key = (attribute, axis, tuple(id(getattr(result, attribute)) for result in results))
+        if shared_arrays is not None and key in shared_arrays:
+            return shared_arrays[key]
+        if populated and array_directory is not None and not any(value.dtype.hasobject for value in populated) and sum(value.nbytes for value in populated) >= 1024 * 1024:
+            import tempfile
+            from pathlib import Path
+            shape = list(populated[0].shape)
+            shape[axis] = sum(value.shape[axis] for value in populated)
+            with tempfile.NamedTemporaryFile(dir=array_directory, suffix='.npy', delete=False) as handle:
+                filename = Path(handle.name)
+            output = np.lib.format.open_memmap(filename, mode='w+',
+                                               dtype=np.result_type(*[a.dtype for a in populated]), shape=tuple(shape))
+            offset = 0
+            for value in populated:
+                selection = [slice(None)] * len(shape)
+                selection[axis] = slice(offset, offset + value.shape[axis])
+                output[tuple(selection)] = value
+                offset += value.shape[axis]
+            output.flush()
+        else:
+            output = np.concatenate(populated, axis=axis) if populated else arrays[0].copy()
+        if shared_arrays is not None:
+            shared_arrays[key] = output
+        return output
 
     extents = np.asarray([result.density_extent_nm for result in results], dtype=float)
     density_extent = (

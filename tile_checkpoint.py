@@ -29,19 +29,26 @@ def checkpoint_lock(directory):
 
 def load_checkpoint_run(directory, record_types):
     run = load_analysis_session(Path(directory) / 'run.paintanalysis', record_types)
+    validate_checkpoint_run(run)
+    return run
+
+
+def validate_checkpoint_run(run):
     if not isinstance(run, dict) or run.get('checkpoint_version') != 1:
         raise ValueError('Not a supported tiled-analysis checkpoint folder.')
     if not all(key in run for key in ('run_id', 'analysis', 'context')):
         raise ValueError('The tiled-analysis checkpoint is incomplete.')
-    return run
+    if not isinstance(run['analysis'], dict) or not isinstance(run['context'], dict):
+        raise ValueError('The tiled-analysis checkpoint has invalid source/settings data.')
 
 
 class TileCheckpoint:
-    def __init__(self, directory, run_id, record_types, report=lambda message: None):
+    def __init__(self, directory, run_id, record_types, report=lambda message: None, array_cache_dir=None):
         self.directory = Path(directory)
         self.run_id = run_id
         self.record_types = record_types
         self.report = report
+        self.array_cache_dir = array_cache_dir
 
     def path(self, index):
         return self.directory / f'tile-{index:08d}.paintanalysis'
@@ -51,13 +58,18 @@ class TileCheckpoint:
         if not path.exists():
             return None
         try:
-            record = load_analysis_session(path, self.record_types)
+            record = load_analysis_session(path, self.record_types, array_cache_dir=self.array_cache_dir)
             if (record['run_id'] != self.run_id or record['index'] != index
                     or tuple(record['bounds']) != tuple(bounds) or record['mode'] != mode):
                 raise ValueError('Tile belongs to a different run or geometry.')
             return record['payload']
-        except (OSError, ValueError, KeyError, TypeError, EOFError, BadZipFile) as exc:
-            self.report(f'Recomputing unreadable checkpoint for tile {index + 1}: {exc}')
+        except OSError as exc:
+            if self.array_cache_dir is not None or exc.errno in {12, 13, 24, 28, 30}:
+                raise OSError(f"Cannot create preview cache in {self.array_cache_dir or self.directory}: {exc}. Original checkpoints are unchanged.") from exc
+            self.report(f'Skipping unreadable checkpoint for tile {index + 1}: {exc}')
+            return None
+        except (ValueError, KeyError, TypeError, EOFError, BadZipFile) as exc:
+            self.report(f'Skipping unreadable checkpoint for tile {index + 1}: {exc}')
             return None
 
     def save(self, index, bounds, mode, payload):

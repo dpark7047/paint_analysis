@@ -124,7 +124,9 @@ to browse the saved analysis. Plots may render again on demand, but detection,
 alignment, and classification do not rerun during loading. Overlays that had not
 been built before saving can still be built from the saved aligned localizations.
 
-Saving/loading runs in the background with a progress dialog. Large full-image
+Saving/loading runs in the background with a progress dialog. Loading shows a
+percentage based on archive data read and records restored, including recovery
+snapshots opened through **Resume Tiled Analysis…**. Large full-image
 archives can take time and disk space because they include the source data.
 Saves replace the destination only after writing successfully. Files use a
 versioned ZIP archive of JSON and NumPy arrays, without executable pickle data.
@@ -147,11 +149,43 @@ quickly from the saved source data.
 After restarting, click **Resume Tiled Analysis…** in the Classification tab and
 select that `paint-tiles-…` folder. The app restores the saved dataset and settings,
 reuses completed tiles, and processes the remaining ones. Original CSV and template
-files are not required. Current settings are replaced by the saved run settings;
+files are not required. You can also use **Load Analysis…** to open the folder's
+`run.paintanalysis` file; it offers **View completed tiles** or **Resume analysis**.
+Individual `tile-…` files are not standalone analysis sessions.
+Current settings are replaced by the saved run settings;
 start a new run to use different thresholds or templates. If checkpoint writing
 fails, for example because the drive is full, the run stops and previously saved
 tiles are retained. Free space or copy the entire recovery folder to a larger
 drive, then resume from that folder.
+
+To inspect progress without continuing the run, click **View Completed Tiles…**
+and select the recovery folder. Only completed, readable tile checkpoints are
+combined; unfinished tiles are not analyzed or counted as unclassified. Count
+plots, galleries, aligned-density plots, and other views use this completed subset.
+Graphs display **PARTIAL ANALYSIS — completed/planned tiles** when tiles are missing
+(empty tiles require no checkpoint and count as available). This label remains
+when saving/reloading the partial analysis. Checkpoint files remain unchanged.
+Use **Resume Tiled Analysis…** with the original recovery folder when ready to
+continue; the initial saved settings are restored and missing tiles are processed.
+
+Tiled analysis now combines results sequentially on disk, including new runs,
+resumed runs, and completed-tile previews. Each tile is read or analyzed, appended
+to `.combined-cache/combined-*` inside the recovery folder, then released before
+the next tile. Combined numeric arrays (including regions, alignment images,
+site evidence, and source coordinates) are opened as memory-mapped arrays for
+viewing. Completed-tile previews open with the type-count plot.
+Small arrays are buffered together, and a bounded pool of file handles is reused
+across tiles to reduce repeated open/close overhead on external drives. Buffers
+are flushed before the combined results are opened for viewing.
+
+The combined cache requires additional space on the checkpoint drive. It is
+disposable, not a replacement for the atomic tile archives: an interrupted merge
+can be rebuilt from those archives without repeating completed analysis. Each
+merge uses a new cache directory so existing views keep valid data. You may
+remove `.combined-cache` (and older `.preview-cache` folders) while the app is
+closed; the next merge rebuilds it. Source tables, tile indexing, metadata, and
+some alignment/plot calculations still use RAM, so this is not a fully bounded
+memory pipeline.
 
 Once the run finishes, use **Save Analysis…** to save the normal analysis session.
 Recovery folders are retained until you delete them, so you can also recover from

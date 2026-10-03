@@ -168,3 +168,44 @@ def test_cached_overlay_is_installed_without_building_again():
     restored = app._plot_origami_analysis.call_args.args[0]
     assert restored['identification_generation'] == 3
     assert restored['result'] is state['origami_multi_template_overlay_results']['A']['result']
+
+
+def test_loading_progress_tracks_large_arrays_and_shared_objects(tmp_path):
+    data = np.arange(400_000, dtype=np.float64)
+    path = tmp_path / 'progress.paintanalysis'
+    save_analysis_session(path, {'large': data, 'same': data, 'table': pd.DataFrame({'x': data[:20]})})
+    updates = []
+    loaded = load_analysis_session(path, {}, progress_callback=updates.append)
+    assert updates[0] == 0 and updates[-1] == 100
+    assert updates == sorted(set(updates))
+    assert sum(0 < percent < 90 for percent in updates) >= 3
+    assert loaded['large'] is loaded['same']
+    np.testing.assert_array_equal(loaded['large'], data)
+
+
+def test_empty_analysis_progress_completes(tmp_path):
+    path = tmp_path / 'empty.paintanalysis'
+    save_analysis_session(path, {})
+    updates = []
+    assert load_analysis_session(path, {}, progress_callback=updates.append) == {}
+    assert updates[0] == 0 and updates[-1] == 100
+
+
+def test_large_arrays_can_load_from_disk_cache_without_changing_archive(tmp_path):
+    data = np.arange(40_000, dtype=np.float64)
+    path = tmp_path / 'mapped.paintanalysis'
+    save_analysis_session(path, {'large': data, 'same': data})
+    before = path.read_bytes()
+    cache = tmp_path / 'cache'
+    loaded = load_analysis_session(path, {}, array_cache_dir=cache)
+    assert isinstance(loaded['large'], np.memmap)
+    assert loaded['same'] is loaded['large']
+    assert not loaded['large'].flags.writeable
+    np.testing.assert_array_equal(loaded['large'], data)
+    assert path.read_bytes() == before
+    files = list(cache.rglob('*.npy'))
+    assert len(files) == 1
+    mtime = files[0].stat().st_mtime_ns
+    again = load_analysis_session(path, {}, array_cache_dir=cache)
+    assert files[0].stat().st_mtime_ns == mtime
+    np.testing.assert_array_equal(again['large'], data)

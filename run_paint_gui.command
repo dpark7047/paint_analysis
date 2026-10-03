@@ -35,6 +35,13 @@ if ! "$VENV_DIR/bin/python" -m pip install --upgrade pip || ! "$VENV_DIR/bin/pyt
 fi
 
 echo "Starting PAINT analysis GUI..."
-"$VENV_DIR/bin/python" paint_analysis_gui.py
+GUI_EXIT_STATUS=0
+"$VENV_DIR/bin/python" -X faulthandler paint_analysis_gui.py || GUI_EXIT_STATUS=$?
+if [ "$GUI_EXIT_STATUS" -ne 0 ]; then
+    echo "PAINT analysis exited unexpectedly (status $GUI_EXIT_STATUS)."
+    echo "Status 137 indicates the process was killed; on macOS this can result from memory/swap pressure."
+    echo "Completed checkpoint files are retained."
+fi
 
 read -r "?PAINT analysis GUI closed. Press Return to close this window..."
+exit "$GUI_EXIT_STATUS"

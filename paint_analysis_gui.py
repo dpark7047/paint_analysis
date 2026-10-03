@@ -38,7 +38,8 @@ from matplotlib.path import Path as MatplotlibPath
 from matplotlib.widgets import RectangleSelector
 
 from analysis_session import save_analysis_session, load_analysis_session
-from tile_checkpoint import TileCheckpoint, checkpoint_lock, load_checkpoint_run
+from tile_checkpoint import TileCheckpoint, checkpoint_lock, load_checkpoint_run, validate_checkpoint_run
+from tiled_aggregation import StreamingTileResults, SEQUENCE_PARAMS
 
 from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
                            plot_evidence, plot_sweep, plot_full_detail)
@@ -178,7 +179,7 @@ def independent_origami_pipeline_params(params: dict[str, Any]) -> dict[str, Any
     fresh = {
         key: value
         for key, value in params.items()
-        if key not in ORIGAMI_TRANSIENT_PIPELINE_KEYS
+        if key not in ORIGAMI_TRANSIENT_PIPELINE_KEYS and key != "_checkpoint_preview"
     }
     fresh["_inspection_stage"] = 5
     return fresh
@@ -4927,8 +4928,10 @@ class PaintAnalysisApp(tk.Tk):
         WidgetTooltip(self.origami_tiled_button, "Analyze the full image on the validation ROI lattice, including clipped partial tiles along every edge.")
         ttk.Button(tile_box, text="Resume Tiled Analysis…", command=self.resume_tiled_analysis).grid(
             row=7, column=0, columnspan=2, sticky="ew", pady=(5, 0))
+        ttk.Button(tile_box, text="View Completed Tiles…", command=lambda: self.resume_tiled_analysis(preview_only=True)).grid(
+            row=8, column=0, columnspan=2, sticky="ew", pady=(5, 0))
         ttk.Label(tile_box, textvariable=self.origami_checkpoint_location, wraplength=320).grid(
-            row=8, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+            row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         step_progress(tile_box, 4, 5)
         ttk.Label(
             tile_box,
@@ -5525,6 +5528,18 @@ class PaintAnalysisApp(tk.Tk):
         toggle = self.__dict__.get("origami_show_legends")
         if toggle is None:
             return
+        preview = (self.__dict__.get("origami_identification_params") or {}).get("_checkpoint_preview")
+        for label in list(self.origami_figure.texts):
+            if label.get_gid() == "checkpoint-preview":
+                label.remove()
+        if preview:
+            incomplete = int(preview["completed"]) < int(preview["planned"])
+            label = self.origami_figure.text(
+                0.99, 0.005,
+                f"{'PARTIAL ANALYSIS' if incomplete else 'CHECKPOINT PREVIEW'} — {preview['completed']}/{preview['planned']} tiles",
+                ha="right", va="bottom", fontsize=9, color="#9a3412",
+                bbox=dict(facecolor="white", edgecolor="#fdba74", alpha=0.95, pad=3))
+            label.set_gid("checkpoint-preview")
         visible = bool(toggle.get())
         for axis in self.origami_figure.axes:
             legend = axis.get_legend()
@@ -9506,15 +9521,22 @@ class PaintAnalysisApp(tk.Tk):
         self._remember_file_dialog_dir(directory)
         return directory
 
-    def _checkpointed_tiled_worker(self, directory, run, *, initialize=False):
+    def _checkpointed_tiled_worker(self, directory, run, *, initialize=False, completed_only=False):
         with checkpoint_lock(directory):
             if initialize:
                 self._worker_status(f"Saving source data and analysis settings for recovery to {directory}…")
                 save_analysis_session(Path(directory) / "run.paintanalysis", run)
             checkpoint = TileCheckpoint(directory, run["run_id"], self._analysis_record_types(), self._worker_status)
-            return self._tiled_origami_worker(**run["context"], checkpoint=checkpoint)
+            try:
+                multi = bool(run["context"]["identification_params"].get("custom_templates", ()))
+                with StreamingTileResults(Path(directory) / ".combined-cache", multi) as disk_results:
+                    return self._tiled_origami_worker(**run["context"], checkpoint=checkpoint,
+                                                      completed_only=completed_only, disk_results=disk_results)
+            except OSError as exc:
+                raise OSError(exc.errno, f"Could not build tiled results in {directory}: {exc}. "
+                              "Completed tile checkpoints are retained; resolve the storage error and retry.") from exc
 
-    def resume_tiled_analysis(self):
+    def resume_tiled_analysis(self, *, preview_only=False):
         if (self.__dict__.get("active_worker_count", 0) or self.__dict__.get("analysis_io_busy", False)
                 or self.__dict__.get("origami_identification_running", False)):
             messagebox.showinfo("Analysis busy", "Wait for the current operation before resuming tiled analysis.")
@@ -9523,11 +9545,10 @@ class PaintAnalysisApp(tk.Tk):
                                             initialdir=str(self._file_dialog_initial_dir()), mustexist=True)
         if not directory:
             return
-        records = self._analysis_record_types()
-        self.status.set("Loading tiled-analysis checkpoint…")
-        self._run_worker(lambda: ("tiled_resume", (Path(directory), load_checkpoint_run(directory, records))))
+        self._origami_analysis_io(loading=True, selected_path=Path(directory) / "run.paintanalysis",
+                                  checkpoint_action="preview" if preview_only else "resume")
 
-    def _resume_tiled_checkpoint(self, directory, run):
+    def _resume_tiled_checkpoint(self, directory, run, *, preview_only=False):
         # Restore the embedded source and templates rather than mixing saved tiles
         # with whatever dataset/settings happen to be open in the current app.
         snapshot = run["analysis"]
@@ -9537,15 +9558,21 @@ class PaintAnalysisApp(tk.Tk):
         run["context"]["identification_params"]["identification_generation"] = self.origami_identification_generation
         self.origami_identification_running = True
         self.origami_active_step = 5
-        self._set_origami_step_progress(5, 0.0, "Resuming saved tiles…")
+        self._set_origami_step_progress(5, 0.0, "Loading completed tiles…" if preview_only else "Resuming saved tiles…")
         self.origami_identification_progress.set(0.0)
-        self.origami_identification_progress_text.set(f"Resuming checkpoints in {directory}")
+        self.origami_identification_progress_text.set(f"{'Viewing completed tiles' if preview_only else 'Resuming checkpoints'} in {directory}")
         for button in (self.origami_identify_button, self.origami_tiled_button,
                        self.origami_n_tiles_button, self.origami_random_roi_button):
             button.state(["disabled"])
         self._refresh_origami_action_states()
         self._remember_file_dialog_dir(directory)
-        self._run_worker(lambda: self._checkpointed_tiled_worker(directory, run))
+        if preview_only:
+            self.origami_figure.clear()
+            self.origami_figure.text(0.5, 0.5, "Loading completed tiles…", ha="center", va="center")
+            self.origami_canvas.draw_idle()
+            self._run_worker(lambda: self._checkpointed_tiled_worker(directory, run, completed_only=True))
+        else:
+            self._run_worker(lambda: self._checkpointed_tiled_worker(directory, run))
 
     def analyze_tiled_origamis(self, *, use_tile_limit: bool = False) -> None:
         context = self._validated_origami_tile_context() if use_tile_limit else self._validated_origami_tile_context(include_partial_edges=True)
@@ -9659,6 +9686,8 @@ class PaintAnalysisApp(tk.Tk):
         source_params: dict[str, Any],
         overlay_params: dict[str, Any],
         checkpoint: TileCheckpoint | None = None,
+        completed_only: bool = False,
+        disk_results: StreamingTileResults | None = None,
     ) -> tuple[str, Any]:
         identification_params = dict(identification_params)
         identification_params["_tiled_full_field_display"] = len(tile_indices) == len(tile_lattice)
@@ -9717,17 +9746,25 @@ class PaintAnalysisApp(tk.Tk):
         analyzed_nonempty_tiles = 0
         selected_tile_count = len(tile_indices)
         available_tile_count = len(tile_lattice)
+        empty_tile_count = 0
         for selection_index, lattice_index_value in enumerate(tile_indices):
             lattice_index = int(lattice_index_value)
             left = int(np.searchsorted(sorted_ids, lattice_index, side="left"))
             right = int(np.searchsorted(sorted_ids, lattice_index, side="right"))
             if right <= left:
+                empty_tile_count += 1
                 self._origami_identification_worker_progress(
                     80.0 * (selection_index + 1) / selected_tile_count,
                     f"Selected tile {selection_index + 1}/{selected_tile_count} "
                     f"(lattice tile {lattice_index + 1}/{available_tile_count}): empty; skipped.",
                 )
                 continue
+            saved_preview = None
+            if completed_only:
+                saved_preview = checkpoint.load(lattice_index, tile_lattice[lattice_index],
+                                                "multi" if multi_template_mode else "single") if checkpoint else None
+                if saved_preview is None:
+                    continue
             core_indices = sorted_indices[left:right]
             core_x0, core_x1, core_y0, core_y1 = tile_lattice[lattice_index]
             # Run the same spatial input through Steps 1-4 that a validation
@@ -9767,7 +9804,7 @@ class PaintAnalysisApp(tk.Tk):
                     core_y0,
                     core_y1,
                 )
-                tile_payload = checkpoint.load(lattice_index, tile_lattice[lattice_index], "multi") if checkpoint else None
+                tile_payload = saved_preview if completed_only else (checkpoint.load(lattice_index, tile_lattice[lattice_index], "multi") if checkpoint else None)
                 if tile_payload is None:
                     result_kind, tile_payload = self._identify_origami_worker(
                         tile_points, tile_identification_params, tile_progress)
@@ -9779,18 +9816,23 @@ class PaintAnalysisApp(tk.Tk):
                     tile_progress(100.0, "Restored completed tile from checkpoint.")
                 for item in tile_payload["templates"]:
                     item["params"]["identification_generation"] = identification_params.get("identification_generation")
-                multi_tile_payloads.append(tile_payload)
                 tile_unique_count = (
                     int(np.sum(np.asarray(tile_payload["counts"], dtype=int)))
                     + int(tile_payload["unclassified_count"])
                     + int(tile_payload.get("suppressed_duplicate_count", 0))
                 )
                 candidate_count += tile_unique_count
+                if disk_results is not None:
+                    disk_results.append(tile_payload)
+                    self._worker_status(f"Combined tile {lattice_index + 1} on disk; releasing tile data…")
+                    del item, tile_payload, saved_preview
+                else:
+                    multi_tile_payloads.append(tile_payload)
                 if selection_index % 10 == 0:
                     gc.collect()
                 continue
 
-            saved_tile = checkpoint.load(lattice_index, tile_lattice[lattice_index], "single") if checkpoint else None
+            saved_tile = saved_preview if completed_only else (checkpoint.load(lattice_index, tile_lattice[lattice_index], "single") if checkpoint else None)
             if saved_tile is None:
                 picks = identify_origami_regions(
                     tile_points,
@@ -9852,16 +9894,42 @@ class PaintAnalysisApp(tk.Tk):
                 picks, core_count = saved_tile["picks"], saved_tile["core_count"]
                 tile_progress(100.0, "Restored completed tile from checkpoint.")
             candidate_count += core_count
-            tile_pick_results.append(picks)
             rejected_count += core_count - picks.accepted_count
-            accepted_regions.extend(region.copy() for region in picks.accepted_aligned_regions)
+            if disk_results is not None:
+                disk_results.append({"picks": picks})
+            else:
+                tile_pick_results.append(picks)
+                accepted_regions.extend(region.copy() for region in picks.accepted_aligned_regions)
             accepted_centers.extend(
                 np.median(region, axis=0)
                 for region, accepted in zip(picks.regions, picks.accepted_mask)
                 if bool(accepted)
             )
+            if disk_results is not None:
+                del picks, saved_tile, saved_preview
             if selection_index % 10 == 0:
                 gc.collect()
+
+        del x_nm, y_nm, sorted_ids
+        if disk_results is not None and disk_results.tiles:
+            self._origami_identification_worker_progress(81.0, "Opening combined results from disk…")
+            combined_disk_payload = disk_results.finish()
+            if multi_template_mode:
+                multi_tile_payloads = [combined_disk_payload]
+            else:
+                picks = combined_disk_payload["picks"]
+                tile_pick_results = [picks]
+                accepted_regions = picks.accepted_aligned_regions
+
+        if completed_only:
+            if not analyzed_nonempty_tiles:
+                raise ValueError("No completed nonempty tile checkpoints are available to view. Resume the analysis to process tiles first.")
+            identification_params["_checkpoint_preview"] = {
+                "completed": analyzed_nonempty_tiles + empty_tile_count,
+                "planned": selected_tile_count,
+            }
+            selected_tile_count = analyzed_nonempty_tiles + empty_tile_count
+            identification_params["_tiled_full_field_display"] = False
 
         if multi_template_mode:
             if not multi_tile_payloads:
@@ -9870,38 +9938,21 @@ class PaintAnalysisApp(tk.Tk):
                 str(item["name"]) for item in multi_tile_payloads[0]["templates"]
             ]
             combined_templates: list[dict[str, Any]] = []
-            sequence_param_names = (
-                "classification_observed_digital_states",
-                "classification_exact_digital_match",
-                "classification_lattice_precision",
-                "classification_empty_cell_fraction",
-                "classification_bright_cell_probability",
-                "classification_cell_pattern_correlation",
-                "classification_cell_agreement",
-                "classification_monte_carlo_posterior",
-                "classification_monte_carlo_log_bayes_factor",
-                "classification_scores",
-                "classification_dispositions",
-                "classification_qc_eligible",
-                "classification_lookup_eligible",
-                "_alignment_accepted_mask",
-                "classification_winner_margins",
-                "classification_runner_up_templates",
-                "classification_template_probabilities",
-                "classification_raw_template_probabilities",
-                "classification_template_probability_vectors",
-                "classification_raw_template_probability_vectors",
-                "classification_crop_retained_fraction",
-                "classification_logical_bit_probabilities",
-                "digital_group_localization_evidence",
-                "digital_group_prominences",
-                "digital_pixel_probabilities",
-            )
+            shared_arrays = {}
+            array_directory = None
+            if completed_only and checkpoint is not None:
+                array_directory = checkpoint.array_cache_dir
+                if array_directory is not None:
+                    Path(array_directory).mkdir(parents=True, exist_ok=True)
+            sequence_param_names = SEQUENCE_PARAMS
             for template_index, name in enumerate(template_names):
                 tile_items = [payload["templates"][template_index] for payload in multi_tile_payloads]
                 if any(str(item["name"]) != name for item in tile_items):
                     raise RuntimeError("Template order changed while aggregating tiled classifications.")
                 combined_params = dict(tile_items[0]["params"])
+                if completed_only:
+                    combined_params["_checkpoint_preview"] = dict(identification_params["_checkpoint_preview"])
+                    combined_params["_tiled_full_field_display"] = False
                 for parameter_name in sequence_param_names:
                     if parameter_name in {"classification_lookup_eligible", "_alignment_accepted_mask"} and not any(parameter_name in item["params"] for item in tile_items):
                         continue
@@ -9913,8 +9964,9 @@ class PaintAnalysisApp(tk.Tk):
                 combined_templates.append(
                     {
                         "name": name,
-                        "picks": concatenate_origami_pick_results(
-                            [item["picks"] for item in tile_items]
+                        "picks": tile_items[0]["picks"] if disk_results is not None else concatenate_origami_pick_results(
+                            [item["picks"] for item in tile_items], shared_arrays=shared_arrays,
+                            array_directory=array_directory,
                         ),
                         "params": combined_params,
                     }
@@ -9927,17 +9979,19 @@ class PaintAnalysisApp(tk.Tk):
                 axis=0,
             )
             assigned_count = int(np.sum(combined_counts))
-            combined_indices = np.concatenate(analyzed_source_indices)
             # Whole-image overviews retain edge localizations as spatial context.
             # Classification still runs only on the selected tiles.
-            combined_locs = (selected if selected_tile_count == available_tile_count else selected.iloc[combined_indices]).copy()
-            combined_points_nm = combined_locs[["x", "y"]].to_numpy(dtype=float) * pixelsize
+            combined_locs = selected if selected_tile_count == available_tile_count else selected.iloc[np.concatenate(analyzed_source_indices)]
+            combined_points_nm = (disk_results.source_points(combined_locs, pixelsize) if disk_results is not None
+                                  else combined_locs[["x", "y"]].to_numpy(dtype=float) * pixelsize)
             limited_selection = selected_tile_count < available_tile_count
             selection_description = (
                 f"{selected_tile_count} spatially distributed of {available_tile_count} available ROI tiles"
                 if limited_selection
                 else f"all {selected_tile_count} ROI tiles" + (" including partial edges" if identification_params.get("_include_partial_edge_tiles") else "")
             )
+            if completed_only:
+                selection_description = f"checkpoint preview: {selected_tile_count}/{identification_params['_checkpoint_preview']['planned']} tiles available"
             unclassified_centers = [
                 np.asarray(payload.get("unclassified_centers_nm", np.empty((0, 2))), dtype=float).reshape(-1, 2)
                 for payload in multi_tile_payloads
@@ -9947,7 +10001,7 @@ class PaintAnalysisApp(tk.Tk):
                 for payload in multi_tile_payloads
                 for detail in payload.get("unclassified_details", ())
             ]
-            self._origami_identification_worker_progress(100.0, "Tiled template classification complete.")
+            self._origami_identification_worker_progress(100.0, "Checkpoint preview ready." if completed_only else "Tiled template classification complete.")
             return "origami_multi_picks", {
                 "templates": combined_templates,
                 "counts": combined_counts,
@@ -9958,7 +10012,7 @@ class PaintAnalysisApp(tk.Tk):
                     int(payload.get("suppressed_duplicate_count", 0)) for payload in multi_tile_payloads
                 ),
                 "unclassified_centers_nm": (
-                    np.concatenate(unclassified_centers, axis=0)
+                    (unclassified_centers[0] if disk_results is not None else np.concatenate(unclassified_centers, axis=0))
                     if unclassified_centers
                     else np.empty((0, 2), dtype=float)
                 ),
@@ -10018,17 +10072,22 @@ class PaintAnalysisApp(tk.Tk):
             symmetrize_180=identification_params.get("alignment_template_image") is None,
             progress_callback=alignment_progress,
         )
-        combined_picks = concatenate_origami_pick_results(tile_pick_results)
-        combined_indices = np.concatenate(analyzed_source_indices)
-        combined_locs = (selected if selected_tile_count == available_tile_count else selected.iloc[combined_indices]).copy()
-        combined_points_nm = combined_locs[["x", "y"]].to_numpy(dtype=float) * pixelsize
+        if disk_results is not None:
+            combined_picks = tile_pick_results[0]
+        else:
+            combined_picks = concatenate_origami_pick_results(tile_pick_results)
+        combined_locs = selected if selected_tile_count == available_tile_count else selected.iloc[np.concatenate(analyzed_source_indices)]
+        combined_points_nm = (disk_results.source_points(combined_locs, pixelsize) if disk_results is not None
+                                  else combined_locs[["x", "y"]].to_numpy(dtype=float) * pixelsize)
         limited_selection = selected_tile_count < available_tile_count
         selection_description = (
             f"{selected_tile_count} spatially distributed of {available_tile_count} available ROI tiles"
             if limited_selection
             else f"all {selected_tile_count} ROI tiles" + (" including partial edges" if identification_params.get("_include_partial_edge_tiles") else "")
         )
-        self._origami_identification_worker_progress(100.0, "Tiled origami analysis complete.")
+        if completed_only:
+            selection_description = f"checkpoint preview: {selected_tile_count}/{identification_params['_checkpoint_preview']['planned']} tiles available"
+        self._origami_identification_worker_progress(100.0, "Checkpoint preview ready." if completed_only else "Tiled origami analysis complete.")
         return "origami_tiled", {
             "result": result,
             "source": f"{source} ({selection_description})",
@@ -10914,6 +10973,8 @@ class PaintAnalysisApp(tk.Tk):
                 kind, payload = self.worker_queue.get_nowait()
                 if kind == "worker_done":
                     self.active_worker_count = max(0, self.__dict__.get("active_worker_count", 0) - 1)
+                elif kind == "analysis_io_progress":
+                    self._update_analysis_load_progress(payload)
                 elif kind == "analysis_io":
                     self._complete_origami_analysis_io(*payload)
                 elif kind == "status":
@@ -11435,8 +11496,12 @@ class PaintAnalysisApp(tk.Tk):
                                 )
                                 self.origami_result = None
                                 self.origami_result_render_settings = None
-                                self.origami_plot_option.set("Identified origami template matches")
-                                self._plot_all_template_classifications()
+                                if self.origami_identification_params.get("_checkpoint_preview"):
+                                    self.origami_plot_option.set("Origami type counts")
+                                    self._plot_origami_type_counts()
+                                else:
+                                    self.origami_plot_option.set("Identified origami template matches")
+                                    self._plot_all_template_classifications()
                                 self._refresh_origami_action_states()
                             assigned = int(np.sum(np.asarray(result_payload["counts"], dtype=int)))
                             rejection_summary = dict(
@@ -17216,17 +17281,75 @@ class PaintAnalysisApp(tk.Tk):
         self.render_origami_plot()
         self.notebook.select(ORIGAMI_TAB)
 
+    def _read_origami_analysis_file(self, path, records, progress_callback=None):
+        result = load_analysis_session(path, records,
+                                       progress_callback=(lambda percent: progress_callback(min(99, percent)))
+                                       if progress_callback is not None else None)
+        if isinstance(result, dict) and "checkpoint_version" in result:
+            validate_checkpoint_run(result)
+            self._validate_origami_analysis(result["analysis"])
+        elif isinstance(result, dict) and {"run_id", "index", "bounds", "mode", "payload"}.issubset(result):
+            raise ValueError("This file contains one tile, not the complete run. Open run.paintanalysis "
+                             "from the same folder, or use Resume Tiled Analysis… and select that folder.")
+        else:
+            self._validate_origami_analysis(result)
+        if progress_callback is not None:
+            progress_callback(100)
+        return result
+
+    def _update_analysis_load_progress(self, percent):
+        progress = self.__dict__.get("_analysis_load_progress")
+        label = self.__dict__.get("_analysis_load_percent")
+        if progress is not None and label is not None:
+            progress.configure(value=percent)
+            label.configure(text=f"{percent:.0f}% — " + ("Ready" if percent >= 100 else
+                                                       "Validating analysis…" if percent >= 99 else "Loading saved data…"))
+
+    def _choose_checkpoint_load_action(self):
+        choice = tk.StringVar(value="cancel")
+        dialog = tk.Toplevel(self)
+        dialog.title("Open tiled-analysis checkpoint")
+        dialog.transient(self.winfo_toplevel())
+        ttk.Label(dialog, text="View results from completed tiles, or resume processing the remaining tiles?",
+                  wraplength=440).pack(padx=20, pady=15)
+        buttons = ttk.Frame(dialog)
+        buttons.pack(padx=15, pady=(0, 15))
+        def choose(action):
+            choice.set(action)
+            dialog.destroy()
+        for text, action in (("View completed tiles", "preview"), ("Resume analysis", "resume"), ("Cancel", "cancel")):
+            ttk.Button(buttons, text=text, command=lambda value=action: choose(value)).pack(side="left", padx=4)
+        dialog.grab_set()
+        self.wait_window(dialog)
+        return choice.get()
+
     def _complete_origami_analysis_io(self, path, loading, analysis, error):
+        checkpoint_action = self.__dict__.pop("_analysis_checkpoint_action", None)
         close_after_save = self.__dict__.pop("_close_after_analysis_save", False)
         dialog = self.__dict__.pop("_analysis_io_dialog", None)
         if dialog is not None:
             dialog.grab_release()
             dialog.destroy()
         self.analysis_io_busy = False
+        self.__dict__.pop("_analysis_load_progress", None)
+        self.__dict__.pop("_analysis_load_percent", None)
         try:
             if error:
                 raise ValueError(error)
             if loading:
+                if isinstance(analysis, dict) and "checkpoint_version" in analysis:
+                    validate_checkpoint_run(analysis)
+                    action = checkpoint_action or self._choose_checkpoint_load_action()
+                    if action == "cancel":
+                        self.status.set("Checkpoint loading canceled.")
+                        return
+                    if action == "preview":
+                        self._resume_tiled_checkpoint(path.parent, analysis, preview_only=True)
+                        self.status.set("Loading completed tiles for inspection; unfinished tiles will not run.")
+                    else:
+                        self._resume_tiled_checkpoint(path.parent, analysis)
+                        self.status.set(f"Resuming tiled analysis from {path.parent}; completed tiles will be reused.")
+                    return
                 self._install_origami_analysis(analysis)
             self._remember_file_dialog_dir(path)
             self.status.set(f"{'Loaded' if loading else 'Saved'} analysis: {path.name}" + (" — no reanalysis required." if loading else ""))
@@ -17237,7 +17360,7 @@ class PaintAnalysisApp(tk.Tk):
         if close_after_save and not loading:
             PaintAnalysisApp._on_close(self, analysis_saved=True)
 
-    def _origami_analysis_io(self, *, loading, close_after_save=False):
+    def _origami_analysis_io(self, *, loading, close_after_save=False, selected_path=None, checkpoint_action=None):
         if self.__dict__.get("analysis_io_busy") or self.__dict__.get("active_worker_count", 0) or self.origami_identification_running or self.session_load_in_progress:
             messagebox.showinfo("Analysis busy", "Wait for the current operation to finish before saving or loading analysis.")
             return
@@ -17246,9 +17369,10 @@ class PaintAnalysisApp(tk.Tk):
             return
         options = dict(initialdir=str(self._file_dialog_initial_dir()),
                        filetypes=[("PAINT analysis", "*.paintanalysis"), ("All files", "*.*")])
-        path_text = (filedialog.askopenfilename(title="Load Origami analysis", **options) if loading else
-                     filedialog.asksaveasfilename(title="Save Origami analysis", defaultextension=".paintanalysis",
-                                                  initialfile="origami_analysis.paintanalysis", **options))
+        path_text = selected_path if selected_path is not None else (
+            filedialog.askopenfilename(title="Load Origami analysis", **options) if loading else
+            filedialog.asksaveasfilename(title="Save Origami analysis", defaultextension=".paintanalysis",
+                                        initialfile="origami_analysis.paintanalysis", **options))
         if not path_text:
             return
         path = Path(path_text)
@@ -17269,19 +17393,25 @@ class PaintAnalysisApp(tk.Tk):
         dialog.transient(self.winfo_toplevel())
         dialog.protocol("WM_DELETE_WINDOW", lambda: None)
         ttk.Label(dialog, text="Loading saved results…" if loading else "Saving results and embedded source data…").pack(padx=25, pady=20)
-        progress = ttk.Progressbar(dialog, mode="indeterminate", length=300)
+        progress = ttk.Progressbar(dialog, mode="determinate" if loading else "indeterminate", maximum=100, length=300)
         progress.pack(padx=25, pady=(0, 20))
-        progress.start()
+        if loading:
+            self._analysis_load_progress = progress
+            self._analysis_load_percent = ttk.Label(dialog, text="0% — Loading saved data…")
+            self._analysis_load_percent.pack(padx=25, pady=(0, 12))
+        else:
+            progress.start()
         dialog.grab_set()
         self._analysis_io_dialog = dialog
+        self._analysis_checkpoint_action = checkpoint_action
         self._close_after_analysis_save = bool(close_after_save and not loading)
         self.status.set(f"{'Loading' if loading else 'Saving'} analysis: {path.name}")
 
         def work():
             try:
                 if loading:
-                    result = load_analysis_session(path, records)
-                    self._validate_origami_analysis(result)
+                    result = self._read_origami_analysis_file(
+                        path, records, lambda percent: self.worker_queue.put(("analysis_io_progress", percent)))
                 else:
                     save_analysis_session(path, payload)
                     result = None

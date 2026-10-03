@@ -4,6 +4,8 @@ from pathlib import Path
 import json
 import os
 import tempfile
+import hashlib
+import shutil
 from zipfile import ZipFile, ZIP_DEFLATED
 
 import numpy as np
@@ -68,15 +70,66 @@ def save_analysis_session(path, state):
             os.unlink(temporary)
 
 
-def load_analysis_session(path, record_types):
+def load_analysis_session(path, record_types, progress_callback=None, array_cache_dir=None):
     """Decode only known data records; reject unsupported archive versions."""
+    cache_directory = None
+    if array_cache_dir is not None:
+        path = Path(path)
+        info = path.stat()
+        identity = hashlib.sha256(f"{path.resolve()}:{info.st_size}:{info.st_mtime_ns}".encode()).hexdigest()[:24]
+        cache_directory = Path(array_cache_dir) / identity
+        cache_directory.mkdir(parents=True, exist_ok=True)
     with ZipFile(path) as archive:
-        manifest = json.loads(archive.read('manifest.json'))
+        total_bytes = max(1, sum(entry.file_size for entry in archive.infolist()))
+        bytes_read, nodes_done, last_percent = 0, 0, -1
+        node_count = 1
+
+        def report(finished=False):
+            nonlocal last_percent
+            percent = 100 if finished else min(99, int(90 * bytes_read / total_bytes + 9 * nodes_done / node_count))
+            if progress_callback is not None and percent != last_percent:
+                last_percent = percent
+                progress_callback(percent)
+
+        class ProgressReader:
+            def __init__(self, stream):
+                self.stream = stream
+                self.high_water = 0
+
+            def read(self, size=-1):
+                nonlocal bytes_read
+                # Bound reads to report progress even for a single large array.
+                chunks = []
+                remaining = size
+                while remaining != 0:
+                    data = self.stream.read(min(remaining, 1024 * 1024) if remaining > 0 else 1024 * 1024)
+                    if not data:
+                        break
+                    chunks.append(data)
+                    position = self.stream.tell()
+                    bytes_read += max(0, position - self.high_water)
+                    self.high_water = max(position, self.high_water)
+                    report()
+                    if remaining > 0:
+                        remaining -= len(data)
+                return b''.join(chunks)
+
+            def seek(self, *args):
+                return self.stream.seek(*args)
+
+            def tell(self):
+                return self.stream.tell()
+
+        report()
+        with archive.open('manifest.json') as stream:
+            manifest = json.loads(ProgressReader(stream).read())
         if manifest.get('format') != FORMAT or manifest.get('version') != VERSION:
             raise ValueError('Unsupported analysis file format or version.')
         nodes, cache, decoding = manifest['nodes'], {}, set()
+        node_count = max(1, len(nodes))
 
         def decode(value):
+            nonlocal nodes_done
             if not isinstance(value, dict):
                 return value
             index = value['ref']
@@ -88,8 +141,24 @@ def load_analysis_session(path, record_types):
             node = nodes[index]
             kind = node['kind']
             if kind == 'array':
-                with archive.open(node['file']) as stream:
-                    result = np.load(stream, allow_pickle=False)
+                member = archive.getinfo(node['file'])
+                if cache_directory is not None and member.file_size >= 64 * 1024:
+                    cached_path = cache_directory / f"array-{index}.npy"
+                    if not cached_path.exists() or cached_path.stat().st_size != member.file_size:
+                        temporary = None
+                        try:
+                            with tempfile.NamedTemporaryFile(dir=cache_directory, delete=False) as target:
+                                temporary = Path(target.name)
+                                with archive.open(member) as stream:
+                                    shutil.copyfileobj(ProgressReader(stream), target, length=1024 * 1024)
+                            os.replace(temporary, cached_path)
+                        finally:
+                            if temporary is not None:
+                                temporary.unlink(missing_ok=True)
+                    result = np.load(cached_path, mmap_mode='r', allow_pickle=False)
+                else:
+                    with archive.open(member) as stream:
+                        result = np.load(ProgressReader(stream), allow_pickle=False)
             elif kind == 'object_array':
                 result = np.empty(node['shape'], dtype=object)
                 if result.size != len(node['values']):
@@ -116,6 +185,10 @@ def load_analysis_session(path, record_types):
                 raise ValueError(f'Unsupported analysis node: {kind}')
             cache[index] = result
             decoding.remove(index)
+            nodes_done += 1
+            report()
             return result
 
-        return decode(manifest['root'])
+        result = decode(manifest['root'])
+        report(finished=True)
+        return result
