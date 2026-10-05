@@ -17,6 +17,12 @@ from scipy.sparse.csgraph import connected_components
 from scipy.special import logsumexp
 from scipy.spatial import cKDTree
 
+import classification_compute as compute
+
+# Only origami calculations use these adapters. Picasso drift is untouched.
+gaussian_filter = compute.gaussian_filter
+fftconvolve = compute.fftconvolve
+
 
 @dataclass
 class OrigamiAnalysisResult:
@@ -345,7 +351,7 @@ def lattice_template_probability_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -492,7 +498,7 @@ def lattice_count_template_probability_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -716,6 +722,7 @@ def logical_bit_template_evidence(
     return posterior, log_bayes_factor, bit_probability, pattern_correlation
 
 
+@compute.timed
 def direct_digital_group_localization_evidence(
     aligned_regions: Sequence[np.ndarray],
     lattice_points_nm: np.ndarray,
@@ -760,6 +767,9 @@ def direct_digital_group_localization_evidence(
         raise ValueError("Brightness factors must contain one positive finite value per digital group.")
 
     evidence = np.zeros((len(aligned_regions), len(groups)), dtype=float)
+    accelerated = compute.group_evidence(aligned_regions, grid, groups, radius, factors)
+    if accelerated is not None:
+        return accelerated
     group_trees = [cKDTree(grid[cells]) for cells in groups]
     radius_squared = radius * radius
     for region_index, region_value in enumerate(aligned_regions):
@@ -997,7 +1007,7 @@ def lattice_template_on_site_fractions(
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
 
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -1037,7 +1047,7 @@ def detected_lattice_template_agreement(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -1189,7 +1199,7 @@ def monte_carlo_template_evidence(
         raise ValueError("Lattice-site evidence must have one column per lattice cell.")
     full_grid = ideal_grid_points(rows, columns, spacing_x_nm, spacing_y_nm)
     template = np.asarray(template_points_nm, dtype=float)
-    distances, cells = cKDTree(full_grid).query(template, k=1)
+    distances, cells = compute.template_tree(full_grid).query(template, k=1)
     tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(distances > tolerance_nm):
         raise ValueError("Custom-template sites do not map to the configured row/column lattice.")
@@ -1274,7 +1284,7 @@ def lattice_template_empty_cell_fractions(
     template = np.asarray(template_points_nm, dtype=float)
     if template.ndim != 2 or template.shape[1] != 2 or not len(template):
         raise ValueError("Lattice classification requires at least one 2D template point.")
-    grid_tree = cKDTree(full_grid)
+    grid_tree = compute.template_tree(full_grid)
     template_distances, template_cells = grid_tree.query(template, k=1)
     mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
     if np.any(template_distances > mapping_tolerance_nm):
@@ -1911,6 +1921,7 @@ def cluster_aligned_origami_sites(
     return counts, display_labels, center_array, np.asarray(site_indices, dtype=int)
 
 
+@compute.timed
 def density_map_for_origami_picking(
     points_nm: np.ndarray,
     bin_size_nm: float,
@@ -2092,6 +2103,7 @@ def _pick_template_supported_regions(
     connect_distance_nm: float,
     density_threshold: float,
     minimum_points: int,
+    alignment_dark_groups_nm: Sequence[dict] | None,
     progress_callback: Callable[[float, str], None] | None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
     """Find bounded poses from shared bright fiducials, without connecting objects.
@@ -2103,7 +2115,8 @@ def _pick_template_supported_regions(
     sites = np.asarray(template_points_nm, dtype=float)
     if sites.ndim != 2 or sites.shape[1] != 2 or len(sites) < 2 or not np.all(np.isfinite(sites)):
         raise ValueError("Candidate template must contain at least two finite x/y sites.")
-    sites = sites - (np.min(sites, axis=0) + np.max(sites, axis=0)) / 2.0
+    design_center = (np.min(sites, axis=0) + np.max(sites, axis=0)) / 2.0
+    sites = sites - design_center
     if np.max(np.ptp(sites, axis=0)) <= 0.0:
         raise ValueError("Candidate template sites must span a nonzero distance.")
     if progress_callback is not None:
@@ -2310,6 +2323,7 @@ def _pick_origami_regions(
     return regions, density, contrast, extent, component_labels
 
 
+@compute.timed
 def pick_origami_candidates(
     points_nm: np.ndarray,
     *,
@@ -2319,6 +2333,7 @@ def pick_origami_candidates(
     minimum_points: int = 1,
     component_connect_distance_nm: float | None = None,
     candidate_template_points_nm: np.ndarray | None = None,
+    alignment_dark_groups_nm: Sequence[dict] | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[list[np.ndarray], np.ndarray, np.ndarray, tuple[float, float, float, float], np.ndarray]:
     """Join density-supported signal before applying the localization minimum.
@@ -2346,6 +2361,7 @@ def pick_origami_candidates(
         return _pick_template_supported_regions(
             points, density, contrast, extent,
             template_points_nm=candidate_template_points_nm,
+            alignment_dark_groups_nm=alignment_dark_groups_nm,
             bin_size_nm=bin_size_nm, connect_distance_nm=connect_distance_nm,
             density_threshold=density_threshold, minimum_points=minimum_points,
             progress_callback=progress_callback,
@@ -2552,7 +2568,7 @@ def alignment_corner_sites(template_points_nm):
         return np.empty((0, 2), dtype=float)
     low, high = sites.min(axis=0), sites.max(axis=0)
     corners = np.asarray([low, [high[0], low[1]], high, [low[0], high[1]]])
-    indices = np.unique(cKDTree(sites).query(corners)[1])
+    indices = np.unique(compute.template_tree(sites).query(corners)[1])
     return sites[indices]
 
 
@@ -2819,13 +2835,13 @@ def site_gap_contrast_for_regions(
     sample_y = np.linspace(y_lower, y_upper, sample_count)
     sample_xx, sample_yy = np.meshgrid(sample_x, sample_y)
     sample_points = np.column_stack((sample_xx.ravel(), sample_yy.ravel()))
-    sample_distances, _sample_sites = cKDTree(grid).query(sample_points, k=1)
+    sample_distances, _sample_sites = compute.template_tree(grid).query(sample_points, k=1)
     site_area_fraction = float(np.mean(sample_distances <= site_radius_nm))
     site_area_fraction = float(np.clip(site_area_fraction, 1e-6, 1.0 - 1e-6))
 
     contrasts = np.zeros(len(aligned_regions), dtype=float)
     on_site_fractions = np.zeros(len(aligned_regions), dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     for index, region in enumerate(aligned_regions):
         points = np.asarray(region, dtype=float)
         if not len(points):
@@ -2845,6 +2861,7 @@ def sparse_site_evidence_diagnostics(
     grid_points_nm: np.ndarray,
     *,
     site_radius_nm: float,
+    _assignments: tuple[np.ndarray, np.ndarray] | None = None,
 ) -> SparseSiteEvidenceResult:
     """Return per-site support measurements and prominence-sampling geometry.
 
@@ -2871,13 +2888,25 @@ def sparse_site_evidence_diagnostics(
             boundary_reference_positions_nm=np.full((len(grid), 2), np.nan, dtype=float),
             boundary_points_nm=np.full((len(grid), 32, 2), np.nan, dtype=float),
         )
-    distances = np.linalg.norm(points[:, None, :] - grid[None, :, :], axis=2)
-    nearest_sites = np.argmin(distances, axis=1)
-    nearest_distances = distances[np.arange(len(points)), nearest_sites]
+    if compute.mode() == "reference":
+        distances = np.linalg.norm(points[:, None, :] - grid[None, :, :], axis=2)
+        nearest_sites = np.argmin(distances, axis=1)
+        nearest_distances = distances[np.arange(len(points)), nearest_sites]
+    elif _assignments is not None:
+        nearest_distances, nearest_sites = _assignments
+    else:
+        nearest_distances, nearest_sites = compute.nearest_assignments(points, grid, use_gpu=False)
+    if compute.mode() != "reference":
+        # Preserve the original inclusive radius comparison at its boundary.
+        borderline = np.abs(nearest_distances - site_radius_nm) <= 1e-12
+        if np.any(borderline):
+            nearest_distances[borderline] = np.linalg.norm(
+                points[borderline] - grid[nearest_sites[borderline]], axis=1
+            )
     assigned_sites = nearest_sites[nearest_distances <= site_radius_nm]
     on_counts = np.bincount(assigned_sites, minlength=len(grid)).astype(int)
     if len(grid) > 1:
-        nearest_spacing = cKDTree(grid).query(grid, k=2)[0][:, 1]
+        nearest_spacing = compute.template_tree(grid).query(grid, k=2)[0][:, 1]
         typical_spacing = float(np.median(nearest_spacing))
     else:
         typical_spacing = max(2.0 * site_radius_nm, 1.0)
@@ -2916,7 +2945,14 @@ def sparse_site_evidence_diagnostics(
         mode="constant",
     )
 
-    for site_index, site in enumerate(grid):
+    if compute.mode() != "reference":
+        (prominence, peak_positions, peak_densities, boundary_densities,
+         boundary_reference_densities, boundary_reference_positions,
+         boundary_points) = compute.peak_diagnostics(
+            density, x_centers, y_centers, grid, on_counts, nearest_spacing,
+            site_radius_nm, bandwidth_nm, x_min, y_min, effective_x_nm, effective_y_nm,
+        )
+    for site_index, site in enumerate(grid) if compute.mode() == "reference" else ():
         if on_counts[site_index] == 0:
             continue
         search_radius = min(site_radius_nm, 0.40 * float(nearest_spacing[site_index]))
@@ -2976,6 +3012,33 @@ def sparse_site_evidence_diagnostics(
     )
 
 
+def iter_sparse_site_evidence(regions, grid, *, site_radius_nm):
+    """Stream Step 3 diagnostics, sharing bounded GPU assignment batches."""
+    if compute.mode() in {"reference", "cpu"} or compute.gpu_module() is None:
+        for region in regions:
+            yield sparse_site_evidence_diagnostics(region, grid, site_radius_nm=site_radius_nm)
+        return
+    start = 0
+    while start < len(regions):
+        stop = start + 1
+        point_count = len(regions[start])
+        while stop < len(regions) and stop - start < 32 and point_count + len(regions[stop]) <= 65536:
+            point_count += len(regions[stop])
+            stop += 1
+        batch = regions[start:stop]
+        points = np.concatenate(batch) if len(batch) > 1 else np.asarray(batch[0])
+        distances, indices = compute.nearest_assignments(points, grid)
+        offset = 0
+        for region in batch:
+            end = offset + len(region)
+            yield sparse_site_evidence_diagnostics(
+                region, grid, site_radius_nm=site_radius_nm,
+                _assignments=(distances[offset:end], indices[offset:end]),
+            )
+            offset = end
+        start = stop
+
+
 def sparse_site_evidence(
     aligned_region: np.ndarray,
     grid_points_nm: np.ndarray,
@@ -3014,14 +3077,16 @@ def supported_site_spacing_errors(
     supported_sites: np.ndarray,
     *,
     site_radius_nm: float,
+    centroids: np.ndarray | None = None,
 ) -> tuple[float, float]:
     """Return RMS and maximum pairwise spacing errors for supported site centroids."""
-    centroids = supported_site_centroids(
-        aligned_region,
-        grid_points_nm,
-        supported_sites,
-        site_radius_nm=site_radius_nm,
-    )
+    if centroids is None:
+        centroids = supported_site_centroids(
+            aligned_region,
+            grid_points_nm,
+            supported_sites,
+            site_radius_nm=site_radius_nm,
+        )
     retained_indices = np.flatnonzero(np.all(np.isfinite(centroids), axis=1))
     if len(retained_indices) < 2:
         return float("inf"), float("inf")
@@ -3051,7 +3116,7 @@ def supported_site_centroids(
     supported_indices = np.flatnonzero(supported)
     if not len(supported_indices) or not len(points):
         return centroids
-    distances, nearest_sites = cKDTree(grid).query(points, k=1)
+    distances, nearest_sites = compute.template_tree(grid).query(points, k=1)
     for site_index in supported_indices:
         assigned = points[(nearest_sites == site_index) & (distances <= site_radius_nm)]
         if not len(assigned):
@@ -3116,7 +3181,7 @@ def grid_vs_blob_delta_bic(
     )
     observation = image.T.ravel().astype(float)
     if len(grid) > 1:
-        nearest_grid_spacing = float(np.median(cKDTree(grid).query(grid, k=2)[0][:, 1]))
+        nearest_grid_spacing = float(np.median(compute.template_tree(grid).query(grid, k=2)[0][:, 1]))
     else:
         nearest_grid_spacing = max(rectangle_width_nm, rectangle_height_nm)
     minimum_sigma = max(1.5, 0.75 * pixel_nm)
@@ -3446,7 +3511,7 @@ def _sparse_pose_quality(
     grid = np.asarray(grid_points_nm, dtype=float)
     if not len(points) or not len(grid):
         return -1.0
-    distances, sites = cKDTree(grid).query(points, k=1)
+    distances, sites = compute.template_tree(grid).query(points, k=1)
     counts = np.bincount(
         sites[distances <= site_radius_nm], minlength=len(grid)
     ).astype(float)
@@ -3550,7 +3615,7 @@ def alignment_fiducial_support(points, sites, radius_nm, minimum_localizations):
     counts = np.zeros(len(sites), dtype=int)
     residuals = np.full(len(sites), np.inf)
     if len(points) and len(sites):
-        distances, nearest = cKDTree(sites).query(points)
+        distances, nearest = compute.template_tree(sites).query(points)
         for index in range(len(sites)):
             local = distances[(nearest == index) & (distances <= radius_nm)]
             counts[index] = len(local)
@@ -3588,7 +3653,7 @@ def _refine_sparse_grid_pose(
     refined = original.copy()
     accumulated_rotation = np.eye(2, dtype=float)
     accumulated_offset = np.zeros(2, dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     for _iteration in range(max(0, int(iterations))):
         distances, sites = grid_tree.query(refined, k=1)
         observed_centroids: list[np.ndarray] = []
@@ -3835,7 +3900,7 @@ def _refine_pose_from_lattice_centroids(
     refined = original.copy()
     accumulated_rotation = np.eye(2, dtype=float)
     accumulated_offset = np.zeros(2, dtype=float)
-    grid_tree = cKDTree(grid)
+    grid_tree = compute.template_tree(grid)
     retained_count = 0
     retained_rms = float("inf")
     for _iteration in range(max(0, int(iterations))):
@@ -3902,6 +3967,104 @@ def _refine_pose_from_lattice_centroids(
     return accumulated_rotation, accumulated_offset, retained_count, retained_rms
 
 
+def explicit_dark_geometry(groups):
+    """Union of user-authored circular masks; no inferred inter-site gaps."""
+    points, radii = [], []
+    for group in groups or ():
+        sites = np.asarray(group["points_nm"], dtype=float).reshape(-1, 2)
+        radius = float(group["mask_radius_nm"])
+        if not np.isfinite(sites).all() or not np.isfinite(radius) or radius <= 0:
+            raise ValueError("Dark groups need finite positions and a positive mask radius.")
+        points.extend(sites)
+        radii.extend([radius] * len(sites))
+    if not points:
+        return None
+    points, radii = np.asarray(points), np.asarray(radii)
+    lower, upper = (points-radii[:, None]).min(axis=0), (points+radii[:, None]).max(axis=0)
+    geometry = dict(points=points, radii=radii, lower=lower, upper=upper)
+    # Integrate each disk locally, counting overlaps only once. A global raster
+    # can miss small masks that are far apart and incorrectly report zero area.
+    radial, angle = np.meshgrid(np.sqrt((np.arange(32)+.5)/32), (np.arange(128)+.5)*2*np.pi/128)
+    disk = np.column_stack([(radial*np.cos(angle)).ravel(), (radial*np.sin(angle)).ravel()])
+    area = 0.0
+    for index, (center, radius) in enumerate(zip(points, radii)):
+        samples = center + radius*disk
+        covered = np.zeros(len(samples), dtype=bool)
+        for prior, prior_radius in zip(points[:index], radii[:index]):
+            covered |= np.sum((samples-prior)**2, axis=1) <= prior_radius**2
+        area += np.pi*radius**2 * np.mean(~covered)
+    geometry["area"] = float(area)
+    return geometry
+
+
+def dark_mask_contains(points, geometry):
+    points = np.asarray(points).reshape(-1, 2)
+    if isinstance(geometry, dict):
+        mask = np.zeros(len(points), dtype=bool)
+        for center, radius in zip(geometry["points"], geometry["radii"]):
+            mask |= np.sum((points-center)**2, axis=1) <= radius**2
+        return mask
+    lower, upper, tree, radius, _area = geometry
+    return np.all((points >= lower) & (points <= upper), axis=1) & (tree.query(points)[0] > radius)
+
+
+def _digital_gap_density(points, geometry):
+    """Localizations per nm² in the same fixed mask for either orientation."""
+    area = geometry["area"] if isinstance(geometry, dict) else geometry[-1]
+    return float(np.count_nonzero(dark_mask_contains(points, geometry)) / area)
+
+
+DEFAULT_MAX_DARK_BRIGHT_RATIO = 0.25
+
+
+def dark_alignment_ratio(points, sites, geometry, radius_nm, minimum_localizations):
+    """Dark-mask density / median supported bright-site density; lower is better."""
+    if geometry is None:
+        return 0.0
+    distances, nearest = cKDTree(sites).query(points)
+    counts = np.bincount(nearest[distances <= radius_nm], minlength=len(sites))
+    supported = counts[counts >= minimum_localizations]
+    if not len(supported):
+        return float("inf")
+    bright_density = float(np.median(supported)) / (np.pi * radius_nm**2)
+    return _digital_gap_density(points, geometry) / bright_density
+
+
+def _retry_reversed_bright_pose(points, sites, radius_nm, minimum_localizations,
+                                required_sites, bright_valid):
+    """Search only bright evidence within ±10° / ±10 nm of a 180° flip."""
+    best, best_rank = None, (-1, -float("inf"))
+    for degrees in (-10., -5., 0., 5., 10.):
+        angle = np.deg2rad(degrees)
+        rotation = -np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+        for dx in (-10., -5., 0., 5., 10.):
+            for dy in (-10., -5., 0., 5., 10.):
+                offset = np.array([dx, dy])
+                initial = points @ rotation.T + offset
+                refined, correction, correction_offset = _refine_sparse_grid_pose(
+                    initial, sites, site_radius_nm=radius_nm,
+                    minimum_site_localizations=minimum_localizations)
+                combined = correction @ rotation
+                refined_offset = offset @ correction.T + correction_offset
+                # Keep even a local optimizer from escaping the retry window.
+                options = [(initial, rotation, offset)]
+                residual_angle = np.rad2deg(np.arctan2(-combined[1, 0], -combined[0, 0]))
+                if abs(residual_angle) <= 10. + 1e-8 and np.all(np.abs(refined_offset) <= 10. + 1e-8):
+                    options.append((refined, combined, refined_offset))
+                for candidate, candidate_rotation, candidate_offset in options:
+                    valid = bright_valid(candidate)
+                    quality = _sparse_pose_quality(candidate, sites, site_radius_nm=radius_nm,
+                        required_sites=required_sites, minimum_site_localizations=minimum_localizations,
+                        saturate_site_counts=True)
+                    rank = (int(valid), quality)
+                    if rank > best_rank:
+                        best_rank = rank
+                        best = (candidate, candidate_rotation, candidate_offset, bool(valid))
+    return best
+
+
+@compute.timed
+@compute.cpu_only
 def _align_regions_by_image_correlation(
     regions: list[np.ndarray],
     *,
@@ -3922,6 +4085,11 @@ def _align_regions_by_image_correlation(
     sparse_site_radius_nm: float = 7.5,
     sparse_min_site_localizations: int = 3,
     refinement_grid_points_nm: np.ndarray | None = None,
+    digital_site_points_nm: np.ndarray | None = None,
+    alignment_dark_groups_nm: Sequence[dict] | None = None,
+    max_dark_bright_ratio: float = DEFAULT_MAX_DARK_BRIGHT_RATIO,
+    retry_min_correlation: float = 0.0,
+    retry_require_corners: bool = False,
     progress_callback: Callable[[float, str], None] | None = None,
     aligned_image_output: list[np.ndarray] | None = None,
     candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
@@ -4026,6 +4194,9 @@ def _align_regions_by_image_correlation(
     aligned_images = images.copy()
     correlations = np.full(len(images), -1.0, dtype=float)
     histories = [[] for _ in regions]
+    gap_geometry = explicit_dark_geometry(alignment_dark_groups_nm) if uses_custom_template else None
+    translation_reference = template
+    selected_ranks = [None] * len(images)
 
     def support(points):
         return alignment_fiducial_support(points, template_points_nm,
@@ -4040,6 +4211,8 @@ def _align_regions_by_image_correlation(
             supported=evidence["supported"].tolist(), required=evidence["required"].tolist(),
             passed=evidence["passed"],
         ))
+        if gap_geometry is not None:
+            histories[index][-1]["gap_density_per_nm2"] = _digital_gap_density(points, gap_geometry)
     total_alignment_work = iterations * len(images)
     alignment_progress_every = max(1, total_alignment_work // 40)
     for iteration in range(iterations):
@@ -4056,11 +4229,10 @@ def _align_regions_by_image_correlation(
             else:
                 refinement_step = 2.0 / (2.0 ** (iteration - 1))
                 trial_angles = angles[index] + refinement_step * np.asarray([-1.0, -0.5, 0.0, 0.5, 1.0])
-            best_score = -float("inf")
-            best_pose_quality = -float("inf")
-            best_support_rank = (-1, -1.0)
-            best_shift_x = 0.0
-            best_shift_y = 0.0
+            best_rank = selected_ranks[index] or ((-1, -1.0), -float("inf"), -float("inf"), -float("inf"))
+            best_score = float(correlations[index])
+            best_pose_quality = best_rank[2]
+            best_shift_x, best_shift_y = shifts[index]
             best_angle = float(angles[index])
             best_image = aligned_images[index]
             for trial_angle in trial_angles:
@@ -4074,7 +4246,7 @@ def _align_regions_by_image_correlation(
                 )
                 translation_hypotheses = _translation_hypotheses_to_reference(
                     rotated_image,
-                    template,
+                    translation_reference,
                     maximum_candidates=(3 if iteration == 0 else 2) if sparse_pose_site_count > 0 else 1,
                     minimum_separation_pixels=max(3, int(round(sparse_site_radius_nm / pixel_nm))),
                     maximum_shift_pixels=images.shape[1] // 3 if uses_custom_template else None,
@@ -4133,20 +4305,18 @@ def _align_regions_by_image_correlation(
                         )
                         score = _boundary_template_correlation(candidate_image, template)
                         pose_quality = score
-                    # Once a sparse alignment template is available, choose
-                    # the pose exclusively from its site-consensus geometry.
-                    # Adding whole-candidate image correlation here lets very
-                    # bright non-alignment digital groups pull an L_L template
-                    # toward their strokes. Keep raster correlation only as a
-                    # deterministic tie-breaker and reported QC measurement.
+                    # Every rotation/translation competes on bright support, then
+                    # fiducial quality. Correlation
+                    # remains a tie-breaker, not a reward for a dense barcode.
                     selection_quality = pose_quality
                     support_rank = (0, 0.0)
                     if uses_custom_template and sparse_pose_site_count > 0:
                         evidence = support(refined_points)
                         support_rank = (int(evidence["passed"]), float(min(1.0, np.min(
                             evidence["supported"] / evidence["required"]))))
-                    if (support_rank, selection_quality, score) > (best_support_rank, best_pose_quality, best_score):
-                        best_support_rank = support_rank
+                    rank = (support_rank, selection_quality, selection_quality, score)
+                    if rank > best_rank:
+                        best_rank = rank
                         best_pose_quality = selection_quality
                         best_score = score
                         best_shift_x = float(fitted_shift[0] / pixel_nm)
@@ -4157,6 +4327,13 @@ def _align_regions_by_image_correlation(
             shifts[index] = (best_shift_x, best_shift_y)
             aligned_images[index] = best_image
             correlations[index] = best_score
+            selected_ranks[index] = best_rank
+            if gap_geometry is not None:
+                angle = np.deg2rad(-best_angle)
+                rotation = np.array([[np.cos(angle), -np.sin(angle)], [np.sin(angle), np.cos(angle)]])
+                offset = shifts[index] * pixel_nm
+                record(index, f"Bright search · pass {iteration + 1}", rotation, offset,
+                       (regions[index] - centers[index]) @ rotation.T - offset)
             completed_alignment_work = iteration * len(images) + index + 1
             if progress_callback and (
                 completed_alignment_work == total_alignment_work
@@ -4170,8 +4347,7 @@ def _align_regions_by_image_correlation(
 
     # The raster search above finds the correct pose basin efficiently, but
     # its effective pixel size can leave a residual angular error.  Finish in
-    # localization coordinates, where expected alignment marks landing in
-    # dark regions explicitly lower the score.
+    # localization coordinates using bright fiducial evidence.
     if sparse_pose_site_count > 0 and template_points_nm is not None and len(template_points_nm):
         for index, (region, center) in enumerate(zip(regions, centers)):
             raw_angle = np.deg2rad(-float(angles[index]))
@@ -4228,6 +4404,41 @@ def _align_regions_by_image_correlation(
                     )
                 )
                 apply_refinement("Lattice-centroid refinement", centroid_correction, centroid_offset)
+            if gap_geometry is not None:
+                def cropped(points):
+                    return points[(np.abs(points[:, 0]) <= rectangle_width_nm/2) & (np.abs(points[:, 1]) <= rectangle_height_nm/2)]
+
+                def dark_ratio(points):
+                    return dark_alignment_ratio(cropped(points), template_points_nm, gap_geometry,
+                                                sparse_site_radius_nm, sparse_min_site_localizations)
+
+                def bright_valid(points):
+                    points = cropped(points)
+                    if not support(points)["passed"]:
+                        return False
+                    if retry_require_corners and not np.all(alignment_corner_counts(
+                            [points], template_points_nm, sparse_site_radius_nm) >= sparse_min_site_localizations):
+                        return False
+                    rendered = _render_candidate_image(points, np.zeros(2), canvas_side_nm, pixel_nm, max(pixel_nm, 1.))
+                    return _boundary_template_correlation(rendered, template) >= retry_min_correlation
+
+                ratio = dark_ratio(corrected)
+                record(index, "Dark check · original", combined_rotation, corrected_shift_nm, corrected,
+                       ratio <= max_dark_bright_ratio)
+                histories[index][-1].update(dark_bright_ratio=ratio, max_dark_bright_ratio=max_dark_bright_ratio)
+                if ratio > max_dark_bright_ratio:
+                    retry = _retry_reversed_bright_pose(corrected, np.asarray(template_points_nm),
+                        sparse_site_radius_nm, sparse_min_site_localizations, sparse_pose_site_count, bright_valid)
+                    proposed, correction, offset, valid = retry
+                    proposed_rotation = correction @ combined_rotation
+                    proposed_shift = corrected_shift_nm @ correction.T - offset
+                    retry_ratio = dark_ratio(proposed)
+                    accepted_retry = valid and retry_ratio <= max_dark_bright_ratio
+                    record(index, "Dark check · 180° bright refit", proposed_rotation, proposed_shift, proposed, accepted_retry)
+                    histories[index][-1].update(dark_bright_ratio=retry_ratio, max_dark_bright_ratio=max_dark_bright_ratio,
+                                                bright_passed=valid)
+                    if accepted_retry:
+                        corrected, combined_rotation, corrected_shift_nm = proposed, proposed_rotation, proposed_shift
             record(index, "Final fit", combined_rotation, corrected_shift_nm, corrected)
             if progress_callback:
                 progress_callback(72.0, f"Refining and checking fiducial support: candidate {index + 1:,}/{len(regions):,}…")
@@ -4354,6 +4565,7 @@ def fitted_footprint_overlap_fractions(
     return result
 
 
+@compute.timed
 def identify_origami_regions(
     points_nm: np.ndarray,
     *,
@@ -4364,6 +4576,9 @@ def identify_origami_regions(
     max_candidate_points: int,
     component_connect_distance_nm: float | None = None,
     candidate_template_points_nm: np.ndarray | None = None,
+    digital_pixel_cells: Sequence[Sequence[int]] | None = None,
+    alignment_dark_groups_nm: Sequence[dict] | None = None,
+    max_dark_bright_ratio: float = DEFAULT_MAX_DARK_BRIGHT_RATIO,
     rows: int | None = None,
     columns: int | None = None,
     spacing_x_nm: float | None = None,
@@ -4404,6 +4619,8 @@ def identify_origami_regions(
     ] | None = None,
     candidate_image_cache: dict[tuple[object, ...], tuple[object, ...]] | None = None,
 ) -> OrigamiPickResult:
+    if not np.isfinite(max_dark_bright_ratio) or max_dark_bright_ratio < 0:
+        raise ValueError("Maximum dark/bright density ratio must be finite and nonnegative.")
     if not 0.0 <= max_footprint_overlap_fraction <= 1.0:
         raise ValueError("Maximum footprint overlap must be between 0 and 1.")
     points_nm = np.asarray(points_nm, dtype=float)
@@ -4460,6 +4677,7 @@ def identify_origami_regions(
             connect_distance_nm=connect_distance_nm,
             density_threshold=density_threshold,
             candidate_template_points_nm=candidate_template_points_nm,
+            alignment_dark_groups_nm=alignment_dark_groups_nm,
             minimum_points=min_candidate_points if candidate_template_points_nm is not None else 1,
             component_connect_distance_nm=component_connect_distance_nm,
             progress_callback=(
@@ -4526,7 +4744,7 @@ def identify_origami_regions(
             )
         else:
             grid = full_grid
-        template_grid_distances, template_lattice_indices = cKDTree(full_grid).query(grid, k=1)
+        template_grid_distances, template_lattice_indices = compute.template_tree(full_grid).query(grid, k=1)
         template_mapping_tolerance_nm = 0.35 * min(float(spacing_x_nm), float(spacing_y_nm))
         if np.any(template_grid_distances > template_mapping_tolerance_nm):
             raise ValueError("The alignment template does not map onto the configured lattice.")
@@ -4544,6 +4762,15 @@ def identify_origami_regions(
                 sparse_site_radius_nm=site_mask_radius_nm,
                 sparse_min_site_localizations=min_site_localizations,
                 refinement_grid_points_nm=full_grid,
+                alignment_dark_groups_nm=alignment_dark_groups_nm,
+                max_dark_bright_ratio=max_dark_bright_ratio,
+                retry_min_correlation=min_rectangle_confidence if use_correlation_gate else 0.0,
+                retry_require_corners=require_corner_support,
+                digital_site_points_nm=(
+                    full_grid[np.unique(np.asarray(
+                        [cell for group in digital_pixel_cells for cell in group], dtype=int
+                    ))] if digital_pixel_cells is not None else None
+                ),
                 iterations=alignment_iterations,
                 template_points_nm=grid,
                 template_image=alignment_template_image,
@@ -4725,6 +4952,10 @@ def identify_origami_regions(
             alignment_fiducial_support(region, grid, site_mask_radius_nm, min_site_localizations)["passed"]
             for region in aligned_regions
         ], dtype=bool)
+    if alignment_template_image is not None and alignment_dark_groups_nm:
+        dark_geometry = explicit_dark_geometry(alignment_dark_groups_nm)
+        accepted_mask &= np.asarray([dark_alignment_ratio(region, grid, dark_geometry, site_mask_radius_nm,
+            min_site_localizations) <= max_dark_bright_ratio for region in aligned_regions], dtype=bool)
     if require_corner_support and alignment_template_image is not None:
         corner_counts = alignment_corner_counts(aligned_regions, grid, site_mask_radius_nm)
         accepted_mask &= np.all(corner_counts >= min_site_localizations, axis=1)
@@ -4801,6 +5032,7 @@ def identify_origami_regions(
     return result
 
 
+@compute.timed
 def align_picked_origamis(
     picked_regions: list[np.ndarray],
     *,
@@ -4917,7 +5149,7 @@ def align_picked_origamis(
                 site_match_radius_nm=site_radius_nm,
             )
         else:
-            distances, nearest_sites = cKDTree(grid).query(aligned, k=1)
+            distances, nearest_sites = compute.template_tree(grid).query(aligned, k=1)
             supported_sites = supported_grid_site_mask(
                 aligned,
                 grid,

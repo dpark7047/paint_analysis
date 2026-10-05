@@ -1,5 +1,67 @@
 # DNA PAINT Picasso-Style ROI Analyzer
 
+## Optional classification acceleration
+
+The CPU and optional CUDA optimizations from `paint_analysis_dongsung` are
+available in the normal application. Normal launches use the optimized **CPU**
+backend and do not require CuPy. The current dark-group alignment checks,
+180° retry, separate bright/dark display switches, and cached dark-mask drawing
+remain available.
+
+Set `PAINT_CLASSIFICATION_COMPUTE` before launching:
+
+| Value | Behavior |
+| --- | --- |
+| `cpu` (default) | Vectorized site measurements, cached template trees, and reused centroids. |
+| `auto` | Use CUDA where supported; retry on CPU if initialization or a GPU operation fails. |
+| `gpu` | Require CUDA for GPU-eligible operations; report failures instead of silently falling back. |
+| `reference` | Use the original numerical paths for comparisons against optimized processing. |
+
+GPU-eligible work includes large Step 1 Gaussian/FFT maps, Step 3 distance and
+digital-group batches, and large overlay filters. Step 2 pose selection,
+including the dark-check/180° retry, stays on CPU to preserve orientation
+choices. Step 4 uses the same classification rules; tiled runs reuse these
+operations. Values near digital ON/OFF thresholds are rechecked on CPU.
+Picasso G5M fitting and drift correction are unchanged.
+
+The CUDA backend requires a compatible NVIDIA GPU; it does not accelerate an
+Apple GPU. CPU optimizations and plotting improvements also apply on Macs.
+The plotting changes cache full-field contrast, prepare it in workers where
+possible, limit queue-processing time, avoid overlay-triggered zoom loops,
+and skip unnecessary header layouts. Sidebar wheel scrolling also works over
+canvas padding. Step 3 reports its remaining work before reaching 100%.
+
+For an optional Windows CUDA environment (separate from the normal app runtime):
+
+```powershell
+python -m venv .gpu-venv
+.\.gpu-venv\Scripts\python.exe -m pip install -r requirements-gpu.txt pytest
+```
+
+`requirements-gpu.txt` retains the fork's CUDA 13 CuPy dependency. Launch with
+**run_paint_gpu.bat** for `auto`, or **run_paint_reference.bat** for comparison.
+These launchers keep runtime state and diagnostics in `.gpu-state` and disable
+automatic development-session restoration. Existing normal launchers are unchanged.
+Set `PAINT_CLASSIFICATION_LOG` to a JSONL path to record operation timings,
+backend counts, and stack traces for workers running longer than 30 seconds.
+
+The synthetic benchmark does not read experimental data:
+
+```sh
+python benchmark_classification.py --modes reference cpu auto --output .gpu-results/cpu-benchmark.json
+```
+
+On a CUDA machine, omit `--modes` to include forced GPU tests. For strict GPU
+regression checks, set `PAINT_REQUIRE_GPU_TESTS=1` and run
+`python -m pytest tests/test_classification_compute.py -q`. GPU tests otherwise
+skip when CUDA is unavailable. The optional Windows UI regression is enabled
+with `PAINT_TEST_WINDOWS_GUI=1` and runs via
+`python -m pytest tests/test_classification_display_windows.py -q`.
+
+Benchmarks exclude warm-up, compare numerical results and classification calls,
+and report timings by stage. They supplement comparisons on experimental data;
+speedups depend on dataset size and hardware.
+
 This GUI is now map-first:
 
 1. Load a Picasso `.h5`/`.hdf5` file or a localization `.csv` file.
@@ -635,9 +697,11 @@ contributions plus lime supported sites, gray unsupported sites, and amber
 penalized negative-space regions. The theoretical grid overlay is the only
 identification overlay enabled by default and can still be toggled with `Show
 theoretical overlay`. Detected sites and text statistics start disabled. A
-rejected fit is omitted from the theoretical overlay unless `Show text
-statistics` is selected, so any displayed rejected pose is accompanied by its
-failure explanation. A
+rejected fit remains visible in Step 2–3 inspection previews when overlays are
+enabled, including digital-group ON/OFF and expected dark space. A notice
+distinguishes these from accepted fits; enable `Show text statistics` for
+individual failure reasons. Final classification views still hide rejected
+fits unless diagnostic text or corner support is enabled. A
 separate `Show detected sites overlay` control draws filled lime markers only at grid
 locations that pass both `Min locs / site` and `Min site prominence` for that
 individual origami. Filled markers are placed at the measured assigned-site
@@ -914,7 +978,40 @@ fit criteria still apply. **Show corner support diagnostics** remains independen
 its labels say `gate off` when corner counts are only informational. The corner
 requirement is disabled by default.
 
-After exact lookup, **Show theoretical overlay** also draws unclassified objects
+In Picklist Generator, choose the **Dark (alignment)** role to define expected
+empty regions. Select physical lattice sites and set **Dark mask radius (nm)**;
+the union of those circles is the negative-space mask. Dark groups are always
+alignment constraints, not barcode bits, and are stored in the PNG metadata,
+sidecar JSON, and reusable group JSON without adding bright spots to the raster.
+They cannot occupy the same physical sites as bright groups.
+
+Load the newly exported detection/alignment template in Step 1. Steps 1 and 2
+find poses using bright fiducials. At the end of Step 2, the fitted pose must pass
+a dark check: localization density in the union of dark masks divided by the
+median density of supported bright sites must not exceed **Max dark / bright
+(%)**. The initial default is 25%; this is a starting setting, not a calibrated
+threshold for every dataset.
+
+If the original pose passes, it is retained without a reversal search. If it
+fails, Step 2 searches around a 180° flip, allowing ±10° rotation and ±10 nm in
+each translation axis. This retry optimizes bright alignment only. The resulting
+bright fit must then pass the dark check and existing bright-fit requirements.
+If neither pose passes, the candidate is rejected; the original pose remains
+visible for inspection. Darkness never steers the bright-fitting objective.
+If the alignment template has no dark groups, explicit dark groups in the loaded
+Digital Pixel Groups JSON are used instead. Templates without dark groups retain
+bright-only alignment: spaces between digital pixels are no longer inferred.
+
+Enable **Show theoretical overlay dark** to display the authored dark masks as blue
+shading with diagonal hatching on fitted candidates, aligned densities, and gallery
+tiles. **Alignment stages** shows the dark/bright ratio and threshold for the
+original dark check and any reversed-pose check. Rerun **Steps 1–4** after changing dark groups, radius, or calibration.
+
+The bright and dark overlays have separate display switches. After Step 2 both
+are enabled by default; after Step 4 classification only bright is enabled.
+These switches do not change alignment or classification.
+
+After exact lookup, **Show theoretical overlay bright** also draws unclassified objects
 as grey hollow site markers at their locked fitted poses. These markers represent
 the measured ON digital groups plus alignment sites, rather than an arbitrarily
 chosen classification template. They appear with text statistics off, in both

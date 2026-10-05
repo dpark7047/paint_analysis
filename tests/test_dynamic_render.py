@@ -138,7 +138,7 @@ class DynamicRenderTests(unittest.TestCase):
         self.assertEqual(origami_source_fingerprint(first), origami_source_fingerprint(first.copy()))
         self.assertNotEqual(origami_source_fingerprint(first), origami_source_fingerprint(second))
 
-        signature = (10.0, 20.0, 20.0, 0.8, 200, len(first), origami_source_fingerprint(first), None)
+        signature = (10.0, 20.0, 20.0, 0.8, 200, len(first), origami_source_fingerprint(first), None, ())
         candidates = ([first], np.zeros((1, 1)), np.zeros((1, 1)), (0.0, 1.0, 0.0, 1.0), np.zeros((1, 1)))
         app = SimpleNamespace(
             origami_identification_running=False,

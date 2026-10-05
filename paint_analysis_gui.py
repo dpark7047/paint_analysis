@@ -12,7 +12,9 @@ import tempfile
 import traceback
 import gc
 import uuid
+import time
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -33,12 +35,14 @@ matplotlib.use("TkAgg")
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.figure import Figure
-from matplotlib.collections import LineCollection, PolyCollection
+from matplotlib.collections import LineCollection, PolyCollection, PathCollection
 from matplotlib.path import Path as MatplotlibPath
 from matplotlib.widgets import RectangleSelector
 
 from analysis_session import save_analysis_session, load_analysis_session
 from tile_checkpoint import TileCheckpoint, checkpoint_lock, load_checkpoint_run, validate_checkpoint_run
+import classification_compute as compute
+from origami_analysis import iter_sparse_site_evidence
 from tiled_aggregation import StreamingTileResults, SEQUENCE_PARAMS
 
 from origami_review import (review_tables, review_filter_options, review_mask, threshold_sweep,
@@ -47,6 +51,10 @@ from origami_qc import (build_classification_audits, export_classification_audit
                         plot_classification_audit, expected_template_fractions, expected_group_fractions)
 
 from origami_analysis import (
+    explicit_dark_geometry,
+    dark_alignment_ratio,
+    DEFAULT_MAX_DARK_BRIGHT_RATIO,
+    dark_mask_contains,
     OrigamiAnalysisResult,
     OrigamiPickResult,
     alignment_corner_counts,
@@ -120,6 +128,9 @@ DEFAULT_ORIGAMI_EXTRA_COLUMN_GAP_NM = 10.0
 DEFAULT_ORIGAMI_GRID_WIDTH_NM = 11 * DEFAULT_ORIGAMI_SPACING_X_NM + DEFAULT_ORIGAMI_EXTRA_COLUMN_GAP_NM
 DEFAULT_ORIGAMI_GRID_HEIGHT_NM = 7 * DEFAULT_ORIGAMI_SPACING_Y_NM
 ORIGAMI_ALIGNMENT_CACHE_KEYS = (
+    "alignment_dark_groups_nm",
+    "max_dark_bright_ratio",
+    "digital_pixel_model",
     "mirror_all_templates",
     "_alignment_template_signature",
     "column_offsets_nm",
@@ -306,6 +317,64 @@ def origami_stage_cache_matches(
     return all(previous_params.get(key) == current_params.get(key) for key in keys)
 
 
+def origami_digital_alignment_cells(params: dict[str, Any]):
+    """All possible digital positions, independent of classification templates."""
+    model = params.get("digital_pixel_model")
+    if not isinstance(model, dict):
+        return None
+    return model.get("bit_physical_cells", model.get("bit_cells", ()))
+
+
+def origami_with_shared_alignment(params, alignment):
+    """Carry detection-template metadata into fitting even without classifiers."""
+    if alignment is None:
+        return params
+    image = np.asarray(alignment["image"], dtype=float).copy()
+    return {**params, "shared_alignment_template": {**alignment, "image": image},
+            "alignment_template_image": (image if params.get("template_mode", "Custom image") == "Custom image"
+                                         else params.get("alignment_template_image"))}
+
+
+def origami_alignment_dark_groups(params):
+    """Resolve explicit dark groups into the same calibrated frame as bright sites."""
+    alignment = params.get("shared_alignment_template") or {}
+    model = alignment if alignment.get("dark_groups") else (params.get("digital_pixel_model") or {})
+    groups = model.get("dark_groups", ())
+    if not groups:
+        return ()
+    rows, columns = model.get("physical_shape", (params.get("rows"), params.get("columns")))
+    geometry = {**alignment, **params}
+    grid = origami_grid_points(int(rows), int(columns), float(geometry["spacing_x_nm"]),
+                              float(geometry["spacing_y_nm"]), geometry)
+    return tuple(dict(id=group["id"], mask_radius_nm=group["mask_radius_nm"],
+                      points_nm=tuple(map(tuple, grid[list(group["cells"])]))) for group in groups)
+
+
+def dark_groups_from_metadata(metadata):
+    rows, columns = int(metadata["rows"]), int(metadata["columns"])
+    groups = metadata.get("logical_model", {}).get("dark_groups", [])
+    if not isinstance(groups, list):
+        raise ValueError("dark_groups must be a list.")
+    result, ids = [], set()
+    for group in groups:
+        name = str(group.get("id", "")).strip()
+        radius = group.get("mask_radius_nm", 5.0)
+        if not name or name in ids:
+            raise ValueError("Dark groups need unique nonempty identifiers.")
+        if isinstance(radius, bool) or not isinstance(radius, (int, float)) or not math.isfinite(radius) or radius <= 0:
+            raise ValueError("Dark mask radius must be positive and finite.")
+        cells = set()
+        for row, column in group.get("physical_sites", []):
+            if not (1 <= int(row) <= rows and 1 <= int(column) <= columns):
+                raise ValueError("Dark group site is outside the lattice.")
+            cells.add((rows-int(row))*columns + columns-int(column))
+        if not cells:
+            raise ValueError("Dark groups need at least one physical site.")
+        result.append(dict(id=name, cells=tuple(sorted(cells)), mask_radius_nm=float(radius)))
+        ids.add(name)
+    return tuple(result)
+
+
 def origami_source_fingerprint(points_nm: np.ndarray) -> str:
     """Return a stable identity for the exact point cloud used by Step 1."""
     points = np.ascontiguousarray(np.asarray(points_nm, dtype=np.float64))
@@ -467,6 +536,8 @@ def mirror_origami_template_inputs(params: dict[str, Any]) -> dict[str, Any]:
         for key in ("bit_cells", "bit_physical_cells"):
             if key in params:
                 result[key] = tuple(tuple(sorted(reflected_cell(cell) for cell in group)) for group in params[key])
+        if "dark_groups" in params:
+            result["dark_groups"] = tuple({**group, "cells": tuple(sorted(reflected_cell(cell) for cell in group["cells"]))} for group in params["dark_groups"])
         if "alignment_cells" in params:
             result["alignment_cells"] = tuple(sorted(reflected_cell(cell) for cell in params["alignment_cells"]))
     for key in ("digital_pixel_model", "logical_model", "shared_alignment_template"):
@@ -1036,10 +1107,21 @@ def custom_template_display_name(
         embedded_name = metadata.get("display_name", metadata.get("name"))
         if isinstance(embedded_name, str) and embedded_name.strip():
             return embedded_name.strip()
-    name = Path(path).stem
+    # A Mac symbolic filename may contain a literal backslash. Windows Path
+    # interprets it as a directory separator, leaving '.png' as the filename;
+    # Path('.png').stem is still '.png', so the old suffix loop never ended.
+    raw_path = str(path)
+    if re.match(r"^[A-Za-z]:[\\/]", raw_path) or raw_path.startswith("\\\\"):
+        name = raw_path.replace("\\", "/").rsplit("/", 1)[-1]
+    else:
+        name = raw_path.rsplit("/", 1)[-1] if "/" in raw_path else Path(path).name
     image_suffixes = (".png", ".tif", ".tiff", ".jpg", ".jpeg")
-    while any(name.lower().endswith(suffix) for suffix in image_suffixes):
-        name = Path(name).stem
+    while True:
+        suffix = next((suffix for suffix in image_suffixes
+                       if name.lower().endswith(suffix) and len(name) > len(suffix)), None)
+        if suffix is None:
+            break
+        name = name[:-len(suffix)]
     if name == ":":
         return "/"
     if name in {":\\", "\\"}:
@@ -1131,7 +1213,7 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
     active_ids = model.get("active_logical_bits")
     if (
         not isinstance(raw_bits, list)
-        or not raw_bits
+        or (not raw_bits and not raw_alignment_groups and not model.get("dark_groups"))
         or not isinstance(raw_alignment_groups, list)
         or not isinstance(active_ids, list)
     ):
@@ -1205,6 +1287,7 @@ def logical_bit_model_from_metadata(metadata: dict[str, Any]) -> dict[str, Any] 
         "bit_physical_cells": tuple(bit_physical_cells),
         "bit_brightness_factors": tuple(item[3] for item in ordered),
         "alignment_cells": tuple(sorted(alignment_cells)),
+        "dark_groups": dark_groups_from_metadata(metadata),
         "active_bits": tuple(bit_id in active_set for bit_id in bit_ids),
     }
 
@@ -1297,6 +1380,34 @@ def draw_unclassified_theoretical_overlay(axis, details, maximum_candidates=500)
     return [artist]
 
 
+def measured_dark_ratios(picks, params, index=None):
+    groups = origami_alignment_dark_groups(params)
+    if not groups or params.get("alignment_template_image") is None:
+        return np.zeros(len(picks.point_counts) if index is None else 1, dtype=float)
+    regions = picks.aligned_regions if index is None else [picks.aligned_regions[index]]
+    geometry = explicit_dark_geometry(groups)
+    sites = alignment_template_overlay_points(picks.template_points_nm, params)
+    return np.asarray([dark_alignment_ratio(region, sites, geometry,
+        float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
+        int(params.get("min_site_localizations", DEFAULT_ORIGAMI_MIN_SITE_LOCALIZATIONS)))
+        for region in regions], dtype=float)
+
+def required_dark_mask(picks, params, index=None):
+    return measured_dark_ratios(picks, params, index) <= float(
+        params.get("max_dark_bright_ratio", DEFAULT_MAX_DARK_BRIGHT_RATIO))
+
+
+def dark_alignment_failure_reason(picks, params, index):
+    ratio = measured_dark_ratios(picks, params, index)[0]
+    limit = float(params.get("max_dark_bright_ratio", DEFAULT_MAX_DARK_BRIGHT_RATIO))
+    if ratio <= limit:
+        return None
+    if not np.isfinite(ratio):
+        return f"dark alignment: dark/bright undefined (no supported bright sites; limit {limit:.1%})"
+    return f"dark alignment: dark/bright {ratio:.1%} > {limit:.1%} limit"
+
+
+
 def required_fiducial_mask(picks, params, index=None):
     if params.get("alignment_template_image") is None:
         return np.ones(len(picks.point_counts) if index is None else 1, dtype=bool)
@@ -1319,7 +1430,7 @@ def plot_alignment_pose_history(figure, picks, index):
         axis = figure.subplots()
         axis.text(.5, .5, "Rerun Step 2 to record alignment stages.", ha="center", transform=axis.transAxes)
         return
-    axes = np.asarray(figure.subplots(2, 3, sharex=True, sharey=True)).ravel()
+    axes = np.asarray(figure.subplots(max(2, (len(history) + 2) // 3), 3, sharex=True, sharey=True)).ravel()
     points = picks.regions[index]
     all_positions = np.vstack([points] + [entry["world_sites"] for entry in history])
     low, high = all_positions.min(axis=0) - 10, all_positions.max(axis=0) + 10
@@ -1332,6 +1443,10 @@ def plot_alignment_pose_history(figure, picks, index):
             if len(group) and np.max(group) < len(sites):
                 axis.scatter(sites[group, 0], sites[group, 1], s=36, facecolors="none", edgecolors=color)
         support = ", ".join(f"end {i + 1}: {n}/{r}" for i, (n, r) in enumerate(zip(entry["supported"], entry["required"])))
+        if "dark_bright_ratio" in entry:
+            support += f'\ndark/bright: {100*entry["dark_bright_ratio"]:.1f}% (limit {100*entry["max_dark_bright_ratio"]:g}%)'
+        if "gap_density_per_nm2" in entry:
+            support += f'\ngap density: {entry["gap_density_per_nm2"]:.4g} locs/nm² (lower is darker)'
         disposition = "retained" if entry["accepted"] else "DISCARDED"
         axis.set_title(f'{entry["stage"]} ({disposition})\n{support} required — {"PASS" if entry["passed"] else "FAIL"}', fontsize=8)
         axis.set(xlim=(low[0], high[0]), ylim=(low[1], high[1]), xlabel="x (nm)", ylabel="y (nm)")
@@ -1384,6 +1499,49 @@ def draw_corner_support_diagnostics(axis, picks, params, index, *, world_coordin
         label.set_in_layout(False)
         artists.append(label)
     return artists
+
+
+@lru_cache(maxsize=64)
+def _dark_overlay_paths(disks):
+    """Cache template-space contour paths; display needs no mask-area integral."""
+    centers = np.asarray([disk[:2] for disk in disks], dtype=float)
+    radii = np.asarray([disk[2] for disk in disks], dtype=float)
+    lower = (centers-radii[:, None]).min(axis=0)
+    upper = (centers+radii[:, None]).max(axis=0)
+    x, y = (np.linspace(lo, hi, 96) for lo, hi in zip(lower, upper))
+    xx, yy = np.meshgrid(x, y)
+    mask = dark_mask_contains(np.column_stack([xx.ravel(), yy.ravel()]),
+                              dict(points=centers, radii=radii)).reshape(xx.shape)
+    generator = contourpy.contour_generator(x=x, y=y, z=mask.astype(float), fill_type="OuterCode")
+    vertices, codes = generator.filled(.5, 1.5)
+    if not vertices:
+        return ()
+    # One compound path preserves holes and hatches the entire mask once,
+    # instead of repeating the hatch renderer for every disconnected disk.
+    return (MatplotlibPath(np.concatenate(vertices), np.concatenate(codes), readonly=True),)
+
+
+def draw_digital_dark_space(axis, params, transform=None):
+    """Transform cached dark-mask paths without contouring or changing view limits."""
+    groups = origami_alignment_dark_groups(params)
+    disks = tuple(sorted(set((float(x), float(y), float(group["mask_radius_nm"]))
+                  for group in groups for x, y in group["points_nm"])))
+    if not disks:
+        return []
+    paths = _dark_overlay_paths(disks)
+    if not paths:
+        return []
+    if transform is not None:
+        paths = [MatplotlibPath(transform(path.vertices), path.codes) for path in paths]
+    fill = PathCollection(paths, facecolors=["#38bdf8"], edgecolors=["#38bdf8"],
+                          linewidths=0, alpha=.25, hatch="///", zorder=5.8,
+                          transform=axis.transData)
+    boundary = PathCollection(paths, facecolors="none", edgecolors=["#38bdf8"],
+                              linewidths=1.1, zorder=6., transform=axis.transData)
+    for artist in (fill, boundary):
+        artist.set_in_layout(False)
+        axis.add_collection(artist, autolim=False)
+    return [fill, boundary]
 
 
 def draw_alignment_dark_boundary(axis, picks, transform=None):
@@ -3763,6 +3921,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_show_theoretical_overlay = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY
         )
+        self.origami_show_dark_overlay = tk.BooleanVar(value=False)
         self.origami_show_alignment_overlay = tk.BooleanVar(
             value=DEFAULT_ORIGAMI_SHOW_ALIGNMENT_OVERLAY
         )
@@ -3899,6 +4058,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_min_supported_columns = tk.IntVar(value=2)
         self.origami_max_site_spacing_error_nm = tk.DoubleVar(value=DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM)
         self.origami_max_overlap_percent = tk.DoubleVar(value=0.0)
+        self.origami_max_dark_percent = tk.DoubleVar(value=100 * DEFAULT_MAX_DARK_BRIGHT_RATIO)
         self.origami_preview_pixel_nm = tk.DoubleVar(value=1.0)
         self.origami_alignment_max_pixels = tk.IntVar(value=DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS)
         self.origami_alignment_iterations = tk.IntVar(value=DEFAULT_ORIGAMI_ALIGNMENT_PASSES)
@@ -4461,7 +4621,7 @@ class PaintAnalysisApp(tk.Tk):
             lambda event: self.origami_settings_canvas.itemconfigure(settings_window, width=event.width),
         )
 
-        def scroll_origami_settings(event: tk.Event) -> None:
+        def scroll_origami_settings(event: tk.Event) -> str | None:
             if getattr(event, "num", None) == 4:
                 units = -1
             elif getattr(event, "num", None) == 5:
@@ -4471,6 +4631,7 @@ class PaintAnalysisApp(tk.Tk):
                 units = -1 if delta > 0 else 1 if delta < 0 else 0
             if units:
                 self.origami_settings_canvas.yview_scroll(units, "units")
+                return "break"
 
         def bind_settings_scroll(widget: tk.Widget) -> None:
             widget.bind("<MouseWheel>", scroll_origami_settings, add="+")
@@ -4639,20 +4800,27 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_min_points,
             "Components below this localization count are discarded during Step 1. This is the same minimum shown in the Step 4 point limits.",
         )
+        setting_row(
+            coarse_group,
+            6,
+            "Max candidate points",
+            self.origami_max_points,
+            "Maximum cropped localization count accepted in Step 2 and Step 4. This is the same maximum shown in the Step 4 point limits. Rerun Step 2 and subsequent steps after changing.",
+        )
         ttk.Label(
             coarse_group,
             text="Template-guided detection checks the calibrated bright-fiducial geometry. Each connected blue-outlined cluster supplies at most one candidate for alignment. Without a template, density detection joins bright bins using Signal gap. Run Step 1 again after changing detection inputs.",
             wraplength=245,
-        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_candidates_button = ttk.Button(
             coarse_group,
             text="Run Step 1 · Inspect Candidates",
             command=self._run_origami_candidate_stage,
         )
         self.origami_run_candidates_button.grid(
-            row=7, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+            row=8, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        step_progress(coarse_group, 8, 1)
+        step_progress(coarse_group, 9, 1)
         self.origami_shared_alignment_template_name.trace_add(
             "write", lambda *_args: self.origami_signal_gap_entry.state(
                 ["disabled"] if self.origami_shared_alignment_template is not None else ["!disabled"]
@@ -4743,7 +4911,7 @@ class PaintAnalysisApp(tk.Tk):
         setting_row(template_group, 15, "Min supported rows", self.origami_min_supported_rows, "Minimum supported template rows for final acceptance. Shared with Step 4; site-quality acceptance is deferred until sites are measured.")
         setting_row(template_group, 16, "Min supported columns", self.origami_min_supported_columns, "Minimum supported template columns for final acceptance. Shared with Step 4; site-quality acceptance is deferred until sites are measured.")
         setting_row(template_group, 17, "Max spacing error (nm)", self.origami_max_site_spacing_error_nm, "Maximum supported-site spacing error for final acceptance. Shared with Step 4; site-quality acceptance is deferred until sites are measured.")
-        setting_row(template_group, 18, "Correlation threshold", self.origami_min_rectangle_confidence, "Minimum fit correlation when the acceptance gate is enabled. Applied in Step 2 and shared with Step 4. Failed fits are visible only when text statistics is enabled.")
+        setting_row(template_group, 18, "Correlation threshold", self.origami_min_rectangle_confidence, "Minimum fit correlation when the acceptance gate is enabled. Applied in Step 2 and shared with Step 4. Steps 2–3 show failed-fit overlays for inspection; enable text statistics to see failure reasons.")
         fit_correlation_gate = ttk.Checkbutton(
             template_group,
             text="Use correlation acceptance gate",
@@ -4763,20 +4931,22 @@ class PaintAnalysisApp(tk.Tk):
             "Image margins are excluded. 0 rejects any overlap; 100 allows all overlaps. Rerun Step 2 after changing.",
         )
 
+        setting_row(template_group, 22, "Max dark / bright (%)", self.origami_max_dark_percent,
+                    "Post-fit dark density limit relative to median supported bright-site density. Default 25% is a starting point; rerun Step 2 after changing.")
         ttk.Label(
             template_group,
-            text="Fits and locks each candidate's position and rotation. Image templates always require at least half the fiducials at each end (rounded up), splitting along the widest template axis. Each supported mark requires Pose min locs / site within Pose site radius. Interior refinement cannot remove supported marks or worsen their residual by more than 0.25 nm. Select Alignment stages in the candidate panel to compare proposed and retained poses. Correlation, point, and overlap limits also apply now; Require corner support adds a stricter corner check. Site coverage and spacing limits apply during Step 4 acceptance.",
+            text="Fits bright fiducials first, then checks authored dark groups. If the dark check fails, searches for a new bright fit within ±10° and ±10 nm of a 180° reversal, then checks darkness again. Neither pose passing leaves the candidate rejected. Max dark / bright sets the allowed density in dark masks relative to the median supported bright-site density. Select Alignment stages to inspect both checks.",
             wraplength=245,
-        ).grid(row=22, column=0, columnspan=2, sticky="w", pady=(5, 0))
+        ).grid(row=23, column=0, columnspan=2, sticky="w", pady=(5, 0))
         self.origami_run_alignment_button = ttk.Button(
             template_group,
             text="Run Step 2 · Fit and Inspect",
             command=lambda: self.identify_origamis(target_stage=3, display_stage=2),
         )
         self.origami_run_alignment_button.grid(
-            row=23, column=0, columnspan=2, sticky="ew", pady=(7, 0)
+            row=24, column=0, columnspan=2, sticky="ew", pady=(7, 0)
         )
-        step_progress(template_group, 24, 2)
+        step_progress(template_group, 25, 2)
 
         ttk.Label(identify_fields, text="Digital detection, classification, and QC").grid(row=2, column=0, sticky="w", pady=(2, 4))
         self.origami_identify_advanced_frame = ttk.Frame(identify_fields)
@@ -4828,11 +4998,11 @@ class PaintAnalysisApp(tk.Tk):
         point_limits.grid(row=2, column=0, columnspan=2, sticky="ew", pady=3)
         point_limits.columnconfigure(1, weight=1)
         point_limits.columnconfigure(3, weight=1)
-        ttk.Label(point_limits, text="Point limits").grid(row=0, column=0, sticky="w", padx=(0, 8))
-        ttk.Entry(point_limits, textvariable=self.origami_min_points, width=6).grid(row=0, column=1, sticky="ew")
+        ttk.Label(point_limits, text="Point limits (Step 1)").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        ttk.Label(point_limits, textvariable=self.origami_min_points, width=6).grid(row=0, column=1, sticky="ew")
         ttk.Label(point_limits, text="to").grid(row=0, column=2, padx=7)
-        ttk.Entry(point_limits, textvariable=self.origami_max_points, width=6).grid(row=0, column=3, sticky="ew")
-        WidgetTooltip(point_limits, "Accept candidates only when their cropped localization count lies in this inclusive range.")
+        ttk.Label(point_limits, textvariable=self.origami_max_points, width=6).grid(row=0, column=3, sticky="ew")
+        WidgetTooltip(point_limits, "Accept candidates only when their cropped localization count lies in this inclusive range. Adjust Min candidate points and Max candidate points in Step 1.")
         setting_row(acceptance_group, 3, "Min supported sites", self.origami_min_supported_sites, "Minimum independently supported docking sites. This value is also reused while selecting the best sparse alignment pose.")
         setting_row(acceptance_group, 4, "Min supported rows", self.origami_min_supported_rows, "Supported sites must span at least this many template rows.")
         setting_row(acceptance_group, 5, "Min supported columns", self.origami_min_supported_columns, "Supported sites must span at least this many template columns.")
@@ -5180,10 +5350,16 @@ class PaintAnalysisApp(tk.Tk):
                 "Show required corner marks, exact counting radii, and count/minimum: green passes, red fails. Uses cropped aligned points and saved fit settings. Zoom to 12 or fewer candidates for details.",
             ),
             (
-                "Show theoretical overlay",
+                "Show theoretical overlay bright",
                 self.origami_show_theoretical_overlay,
                 self._toggle_origami_theoretical_overlay,
-                "Overlay the active digital groups from the winning Step 4 classification template.",
+                "Overlay expected bright sites at the fitted pose.",
+            ),
+            (
+                "Show theoretical overlay dark",
+                self.origami_show_dark_overlay,
+                self._toggle_origami_theoretical_overlay,
+                "Overlay authored dark-group masks as blue shading with diagonal hatching.",
             ),
             (
                 "Show alignment template overlay",
@@ -5248,7 +5424,7 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_type_order_button = ttk.Button(
             self.origami_qc_display_bar, text="Type-count x-axis order…",
             command=self._edit_origami_type_count_order)
-        self.origami_type_order_button.grid(row=4, column=0, sticky="w", pady=(5, 2))
+        self.origami_type_order_button.grid(row=1 + math.ceil(len(qc_display_specs) / 3), column=0, sticky="w", pady=(5, 2))
         self.origami_qc_display_controls = tuple(qc_display_controls)
         for column in range(3):
             self.origami_qc_display_bar.columnconfigure(column, weight=1)
@@ -5298,8 +5474,9 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_toolbar_frame.grid(row=3, column=0, sticky="ew")
         self.origami_toolbar = OrigamiToolbar(self.origami_canvas, self.origami_toolbar_frame, self)
 
-        for frame in self.origami_stage_frames.values():
-            bind_settings_scroll(frame)
+        # Include the canvas and content padding, where the pointer can land
+        # between controls. Consume the wheel here before plot/root bindings.
+        bind_settings_scroll(self.origami_settings_canvas)
         self._toggle_origami_advanced_sections()
         self._show_origami_stage("Source")
         self._refresh_origami_action_states()
@@ -5345,6 +5522,7 @@ class PaintAnalysisApp(tk.Tk):
             self.origami_min_supported_columns,
             self.origami_max_site_spacing_error_nm,
             self.origami_max_overlap_percent,
+            self.origami_max_dark_percent,
             self.origami_preview_pixel_nm,
             self.origami_alignment_max_pixels,
             self.origami_alignment_iterations,
@@ -5507,6 +5685,9 @@ class PaintAnalysisApp(tk.Tk):
             if inspecting_digital_groups
             else DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY
         )
+        dark_toggle = getattr(self, "origami_show_dark_overlay", None)
+        if dark_toggle is not None:
+            dark_toggle.set(int(completed_stage) == 2)
         self.origami_show_alignment_overlay.set(DEFAULT_ORIGAMI_SHOW_ALIGNMENT_OVERLAY)
         self.origami_show_detected_sites_overlay.set(
             DEFAULT_ORIGAMI_SHOW_DETECTED_SITES_OVERLAY
@@ -5556,15 +5737,13 @@ class PaintAnalysisApp(tk.Tk):
         if self.origami_last_rendered_plot_option in {"Individual origami gallery", "Individual site assignments", "Aligned density"}:
             self.render_origami_plot()
             return
-        enabled = bool(self.origami_show_theoretical_overlay.get())
         if self.origami_last_rendered_plot_option in {
             "Identified origami template matches",
             "Random ROI inspection",
         }:
             self._refresh_origami_footprints()
         else:
-            state = "enabled" if enabled else "disabled"
-            self.status.set(f"The theoretical-site overlay is {state} for the identification overview.")
+            self.status.set("Theoretical overlay display updated.")
 
     def _toggle_origami_alignment_overlay(self) -> None:
         if self.origami_last_rendered_plot_option in {"Individual origami gallery", "Individual site assignments", "Aligned density"}:
@@ -5720,6 +5899,7 @@ class PaintAnalysisApp(tk.Tk):
                 (self.origami_min_supported_columns, 2),
                 (self.origami_max_site_spacing_error_nm, DEFAULT_ORIGAMI_MAX_SITE_SPACING_ERROR_NM),
                 (self.origami_max_overlap_percent, 0.0),
+                (self.origami_max_dark_percent, 100 * DEFAULT_MAX_DARK_BRIGHT_RATIO),
                 (self.origami_preview_pixel_nm, 1.0),
                 (self.origami_alignment_max_pixels, DEFAULT_ORIGAMI_ALIGNMENT_MAX_PIXELS),
                 (self.origami_alignment_iterations, DEFAULT_ORIGAMI_ALIGNMENT_PASSES),
@@ -5729,6 +5909,7 @@ class PaintAnalysisApp(tk.Tk):
                     self.origami_show_theoretical_overlay,
                     DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY,
                 ),
+                (self.origami_show_dark_overlay, False),
                 (
                     self.origami_show_alignment_overlay,
                     DEFAULT_ORIGAMI_SHOW_ALIGNMENT_OVERLAY,
@@ -5787,6 +5968,11 @@ class PaintAnalysisApp(tk.Tk):
 
     def _layout_origami_plot_header(self, event: tk.Event) -> None:
         compact = int(event.width) < 1050
+        # Height changes also emit Configure. Reapplying every grid placement
+        # during a canvas redraw needlessly restarts Tk's layout work.
+        if getattr(self, "origami_plot_header_compact", None) == compact:
+            return
+        self.origami_plot_header_compact = compact
         if compact:
             self.origami_sidebar_toggle_button.grid_configure(row=0, column=0, padx=(0, 6), pady=(0, 3))
             self.origami_view_label.grid_configure(row=0, column=1, padx=(0, 4), pady=(0, 3))
@@ -6916,6 +7102,8 @@ class PaintAnalysisApp(tk.Tk):
                 )
             alignment_template = {
                 "name": custom_template_display_name(path, metadata),
+                "physical_shape": (int(metadata["rows"]), int(metadata["columns"])),
+                "dark_groups": dark_groups_from_metadata(metadata),
                 "path": path,
                 "image": image,
                 "rows": int(metadata["rows"]),
@@ -6967,7 +7155,8 @@ class PaintAnalysisApp(tk.Tk):
             f"Template-guided detection: {alignment_template['name']}\n"
             f"{image.shape[1]} × {image.shape[0]} px; "
             f"{alignment_template['template_pixel_size_x_nm']:g} × "
-            f"{alignment_template['template_pixel_size_y_nm']:g} nm/px"
+            f"{alignment_template['template_pixel_size_y_nm']:g} nm/px\n"
+            f"{len(alignment_template.get('dark_groups', ()))} explicit dark groups"
         )
         self._remember_file_dialog_dir(path)
         self.status.set(
@@ -7035,7 +7224,7 @@ class PaintAnalysisApp(tk.Tk):
         )
         self._remember_file_dialog_dir(path)
         self.status.set(
-            f"Loaded {len(model['bit_ids'])} digital-pixel groups for Step 3 detection."
+            f"Loaded {len(model['bit_ids'])} digital-pixel groups. Rerun Steps 1–2 to apply dark groups, then Step 3 detection."
         )
 
     def _clear_origami_shared_alignment_template(self) -> None:
@@ -7739,6 +7928,14 @@ class PaintAnalysisApp(tk.Tk):
             raise ValueError("The shared alignment template needs at least two calibrated bright sites for candidate detection.")
         return points
 
+    def _origami_candidate_dark_groups(self):
+        params = {"shared_alignment_template": self.origami_shared_alignment_template,
+                  "digital_pixel_model": self.__dict__.get("origami_digital_pixel_model")}
+        mirror = self.__dict__.get("origami_mirror_all_templates")
+        if mirror is not None and mirror.get():
+            params = mirror_origami_template_inputs(params)
+        return origami_alignment_dark_groups(params)
+
     def _origami_candidate_stage_signature(self) -> tuple[Any, ...]:
         fingerprint = str(getattr(self, "origami_source_candidate_fingerprint", ""))
         if not fingerprint and self.origami_source_points_nm is not None:
@@ -7756,6 +7953,7 @@ class PaintAnalysisApp(tk.Tk):
             else 0,
             fingerprint,
             None if template_points is None else tuple(map(tuple, template_points)),
+            PaintAnalysisApp._origami_candidate_dark_groups(self),
         )
 
     def _run_origami_candidate_stage(self) -> None:
@@ -7780,6 +7978,7 @@ class PaintAnalysisApp(tk.Tk):
             _point_count,
             _source_fingerprint,
             candidate_template_points,
+            dark_groups,
         ) = signature
         if (
             bin_size_nm <= 0.0
@@ -7838,6 +8037,7 @@ class PaintAnalysisApp(tk.Tk):
                         connect_distance_nm=connect_distance_nm,
                         component_connect_distance_nm=signal_gap_nm,
                         candidate_template_points_nm=candidate_template_points,
+                        alignment_dark_groups_nm=dark_groups,
                         density_threshold=density_threshold,
                         minimum_points=minimum_points,
                         progress_callback=self._origami_identification_worker_progress,
@@ -7909,6 +8109,7 @@ class PaintAnalysisApp(tk.Tk):
                 "min_supported_columns": int(self.origami_min_supported_columns.get()),
                 "max_site_spacing_error_nm": float(self.origami_max_site_spacing_error_nm.get()),
                 "max_footprint_overlap_fraction": float(self.origami_max_overlap_percent.get()) / 100.0,
+                "max_dark_bright_ratio": float(self.origami_max_dark_percent.get()) / 100.0,
                 "alignment_pixel_nm": float(self.origami_preview_pixel_nm.get()),
                 "alignment_max_patch_pixels": int(self.origami_alignment_max_pixels.get()),
                 "alignment_iterations": int(self.origami_alignment_iterations.get()),
@@ -7958,6 +8159,7 @@ class PaintAnalysisApp(tk.Tk):
                 params["alignment_template_image"] = self.origami_custom_template_image.copy()
         else:
             params["alignment_template_image"] = None
+        params = origami_with_shared_alignment(params, self.origami_shared_alignment_template)
         if not 0.0 <= params["max_footprint_overlap_fraction"] <= 1.0:
             messagebox.showerror("Invalid overlap threshold", "Max overlap must be between 0 and 100 percent.")
             return
@@ -8043,6 +8245,7 @@ class PaintAnalysisApp(tk.Tk):
         params["mirror_all_templates"] = bool(mirror.get()) if mirror is not None else False
         if params["mirror_all_templates"]:
             params = mirror_origami_template_inputs(params)
+        params["alignment_dark_groups_nm"] = origami_alignment_dark_groups(params)
         params["candidate_template_points_nm"] = self._origami_candidate_template_points()
         current_candidate_signature = self._origami_candidate_stage_signature()
         if (
@@ -8167,6 +8370,9 @@ class PaintAnalysisApp(tk.Tk):
             connect_distance_nm=float(params["connect_distance_nm"]),
             component_connect_distance_nm=params.get("component_connect_distance_nm"),
             candidate_template_points_nm=params.get("candidate_template_points_nm"),
+            digital_pixel_cells=origami_digital_alignment_cells(params),
+            alignment_dark_groups_nm=origami_alignment_dark_groups(params),
+            max_dark_bright_ratio=float(params.get("max_dark_bright_ratio", DEFAULT_MAX_DARK_BRIGHT_RATIO)),
             density_threshold=float(params["density_threshold"]),
             min_candidate_points=int(params["min_candidate_points"]),
             max_candidate_points=int(params["max_candidate_points"]),
@@ -8243,8 +8449,10 @@ class PaintAnalysisApp(tk.Tk):
             )
         accepted &= required_corner_mask(picks, params)
         accepted &= required_fiducial_mask(picks, params)
+        accepted &= required_dark_mask(picks, params)
         return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, accepted)
 
+    @compute.timed
     def _remeasure_origami_sites(
         self,
         picks: OrigamiPickResult,
@@ -8290,12 +8498,11 @@ class PaintAnalysisApp(tk.Tk):
         supported_columns = np.zeros(candidate_count, dtype=int)
         spacing_rms = np.full(candidate_count, float("inf"))
         spacing_max = np.full(candidate_count, float("inf"))
-        for index, region in enumerate(picks.aligned_regions):
-            evidence = sparse_site_evidence_diagnostics(
-                region,
-                full_grid,
-                site_radius_nm=radius_nm,
-            )
+        measured_sites = iter_sparse_site_evidence(
+            picks.aligned_regions, full_grid, site_radius_nm=radius_nm,
+        )
+        for index, evidence in enumerate(measured_sites):
+            region = picks.aligned_regions[index]
             lattice_count[index] = evidence.counts
             lattice_prominence[index] = evidence.prominence
             supported_full = (
@@ -8327,12 +8534,14 @@ class PaintAnalysisApp(tk.Tk):
                 template_grid,
                 supported,
                 site_radius_nm=radius_nm,
+                centroids=centroids[index],
             )
             if index + 1 == candidate_count or (index + 1) % max(1, candidate_count // 30) == 0:
                 progress_callback(
-                    100.0 * (index + 1) / max(candidate_count, 1),
+                    80.0 * (index + 1) / max(candidate_count, 1),
                     f"Digital-pixel site detection: {index + 1:,}/{candidate_count:,} candidates...",
                 )
+        progress_callback(82.0, "Measuring site-gap contrast...")
         gap_contrast, on_site_fraction, _area = site_gap_contrast_for_regions(
             picks.aligned_regions,
             template_grid,
@@ -8340,11 +8549,14 @@ class PaintAnalysisApp(tk.Tk):
             rectangle_height_nm=float(picks.rectangle_height_nm),
             site_radius_nm=radius_nm,
         )
+        progress_callback(88.0, "Checking alignment support and footprint overlap...")
         picks = PaintAnalysisApp._apply_origami_alignment_filters(picks, params)
         params["_alignment_accepted_mask"] = tuple(
             bool(value) for value in np.asarray(picks.accepted_mask, dtype=bool)
         )
+        progress_callback(92.0, "Measuring digital-group localization evidence...")
         self._measure_direct_digital_groups(picks, params)
+        progress_callback(100.0, "Digital-pixel measurements complete.")
         return replace(
             picks,
             accepted_mask=picks.accepted_mask.copy(),
@@ -8372,6 +8584,7 @@ class PaintAnalysisApp(tk.Tk):
         )
 
     @staticmethod
+    @compute.timed
     def _measure_direct_digital_groups(
         picks: OrigamiPickResult,
         params: dict[str, Any],
@@ -8411,6 +8624,29 @@ class PaintAnalysisApp(tk.Tk):
                 group_cells,
             )
         )
+        # CUDA reductions can differ by a few final bits. Recheck candidates
+        # close to an ON/OFF gate with the reference CPU measurement; changing
+        # the visible support/prominence threshold is never an optimization.
+        if compute.mode() in {"gpu", "auto"} and compute.status()["gpu_initialized"]:
+            support_gate = float(params.get("min_site_localizations", 0))
+            prominence_gate = float(params.get("min_site_evidence", 0.0))
+            near_gate = np.zeros(len(group_evidence), dtype=bool)
+            if support_gate > 0:
+                near_gate |= np.any(np.abs(group_evidence - support_gate) <= 1e-8 * max(1., support_gate), axis=1)
+            if prominence_gate > 0:
+                raw_prominence = np.maximum(0., 2. * raw_group_probability - 1.)
+                near_gate |= np.any(np.abs(raw_prominence - prominence_gate) <= 1e-8, axis=1)
+            if np.any(near_gate):
+                with compute.use_mode("reference"):
+                    group_evidence[near_gate] = direct_digital_group_localization_evidence(
+                        [picks.aligned_regions[index] for index in np.flatnonzero(near_gate)],
+                        full_grid, group_cells,
+                        assignment_radius_nm=float(params.get("site_mask_radius_nm", DEFAULT_ORIGAMI_SITE_MASK_RADIUS_NM)),
+                        brightness_factors=digital_model.get("bit_brightness_factors"),
+                    )
+                _raw_posterior, _raw_log_bayes, raw_group_probability, _raw_correlation = digital_group_template_evidence(
+                    group_evidence, np.zeros(len(digital_model["bit_ids"]), dtype=bool), group_cells,
+                )
         _posterior, _log_bayes, group_probability, _correlation = (
             digital_group_template_evidence(
                 group_evidence,
@@ -8470,8 +8706,10 @@ class PaintAnalysisApp(tk.Tk):
             )
         accepted &= required_corner_mask(picks, params)
         accepted &= required_fiducial_mask(picks, params)
+        accepted &= required_dark_mask(picks, params)
         return PaintAnalysisApp._reject_overlapping_origami_fits(picks, params, np.asarray(accepted, dtype=bool))
 
+    @compute.timed
     def _identify_origami_worker(
         self,
         points_nm: np.ndarray,
@@ -8536,6 +8774,7 @@ class PaintAnalysisApp(tk.Tk):
                 ),
                 density_threshold=float(params["density_threshold"]),
                 minimum_points=int(params["min_candidate_points"]),
+                alignment_dark_groups_nm=origami_alignment_dark_groups(params),
             )
         emit_progress(
             2.0,
@@ -9066,6 +9305,9 @@ class PaintAnalysisApp(tk.Tk):
                 failure_reasons.append(f"overlapping origami footprints ({overlap[candidate_index]:.0%} of smaller footprint)")
             if not required_fiducial_mask(attempted_picks, attempted_params, candidate_index)[0]:
                 failure_reasons.append("independent fiducial end support missing")
+            dark_failure = dark_alignment_failure_reason(attempted_picks, attempted_params, candidate_index)
+            if dark_failure:
+                failure_reasons.append(dark_failure)
             if not required_corner_mask(attempted_picks, attempted_params, candidate_index)[0]:
                 failure_reasons.append("required corner support missing")
             alignment_mask = np.asarray(
@@ -9463,6 +9705,9 @@ class PaintAnalysisApp(tk.Tk):
             connect_distance_nm=float(identification_params["connect_distance_nm"]),
             component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
             candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
+            digital_pixel_cells=origami_digital_alignment_cells(identification_params),
+            alignment_dark_groups_nm=origami_alignment_dark_groups(identification_params),
+            max_dark_bright_ratio=float(identification_params.get("max_dark_bright_ratio", DEFAULT_MAX_DARK_BRIGHT_RATIO)),
             density_threshold=float(identification_params["density_threshold"]),
             min_candidate_points=int(identification_params["min_candidate_points"]),
             max_candidate_points=int(identification_params["max_candidate_points"]),
@@ -9521,6 +9766,7 @@ class PaintAnalysisApp(tk.Tk):
         self._remember_file_dialog_dir(directory)
         return directory
 
+    @compute.timed
     def _checkpointed_tiled_worker(self, directory, run, *, initialize=False, completed_only=False):
         with checkpoint_lock(directory):
             if initialize:
@@ -9840,6 +10086,9 @@ class PaintAnalysisApp(tk.Tk):
                     connect_distance_nm=float(identification_params["connect_distance_nm"]),
                     component_connect_distance_nm=identification_params.get("component_connect_distance_nm"),
                     candidate_template_points_nm=identification_params.get("candidate_template_points_nm"),
+                    digital_pixel_cells=origami_digital_alignment_cells(identification_params),
+                    alignment_dark_groups_nm=origami_alignment_dark_groups(identification_params),
+                    max_dark_bright_ratio=float(identification_params.get("max_dark_bright_ratio", DEFAULT_MAX_DARK_BRIGHT_RATIO)),
                     density_threshold=float(identification_params["density_threshold"]),
                     min_candidate_points=int(identification_params["min_candidate_points"]),
                     max_candidate_points=int(identification_params["max_candidate_points"]),
@@ -10285,6 +10534,7 @@ class PaintAnalysisApp(tk.Tk):
             )
         )
 
+    @compute.timed
     def _overlay_origami_worker(
         self,
         accepted_regions: list[np.ndarray],
@@ -10955,11 +11205,24 @@ class PaintAnalysisApp(tk.Tk):
         self.active_worker_count = self.__dict__.get("active_worker_count", 0) + 1
 
         def target() -> None:
+            stop_watchdog = threading.Event()
+            if os.environ.get("PAINT_CLASSIFICATION_LOG"):
+                threading.Thread(target=compute.worker_watchdog,
+                                 args=(stop_watchdog, getattr(func, "__name__", "worker")),
+                                 daemon=True).start()
             try:
-                self.worker_queue.put(("result", func()))
+                result = func()
+                if result[0] in {"origami_stage_preview", "origami_picks", "origami_multi_template", "origami_tiled"}:
+                    cached_render = getattr(self, "origami_source_render_result", None)
+                    if cached_render is not None:
+                        # Preparing a full-field image can be expensive; Tk only
+                        # attaches the finished contrast image to its canvas.
+                        PaintAnalysisApp._prepare_origami_display_contrast(cached_render)
+                self.worker_queue.put(("result", result))
             except Exception as exc:
                 self.worker_queue.put(("error", (exc, traceback.format_exc())))
             finally:
+                stop_watchdog.set()
                 self.worker_queue.put(("worker_done", None))
 
         threading.Thread(target=target, daemon=True).start()
@@ -10968,8 +11231,9 @@ class PaintAnalysisApp(tk.Tk):
         self.worker_queue.put(("status", message))
 
     def _poll_worker(self) -> None:
+        poll_deadline = time.monotonic() + 0.04
         try:
-            while True:
+            while time.monotonic() < poll_deadline:
                 kind, payload = self.worker_queue.get_nowait()
                 if kind == "worker_done":
                     self.active_worker_count = max(0, self.__dict__.get("active_worker_count", 0) - 1)
@@ -11359,6 +11623,7 @@ class PaintAnalysisApp(tk.Tk):
                                 self.origami_show_theoretical_overlay.set(
                                     DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY
                                 )
+                                self.origami_show_dark_overlay.set(False)
                                 self.origami_show_alignment_overlay.set(
                                     DEFAULT_ORIGAMI_SHOW_ALIGNMENT_OVERLAY
                                 )
@@ -11476,6 +11741,7 @@ class PaintAnalysisApp(tk.Tk):
                                 self.origami_show_theoretical_overlay.set(
                                     DEFAULT_ORIGAMI_SHOW_THEORETICAL_OVERLAY
                                 )
+                                self.origami_show_dark_overlay.set(False)
                                 self.origami_show_alignment_overlay.set(
                                     DEFAULT_ORIGAMI_SHOW_ALIGNMENT_OVERLAY
                                 )
@@ -12248,6 +12514,19 @@ class PaintAnalysisApp(tk.Tk):
         self.temporal_canvas.draw_idle()
         self.notebook.select(TEMPORAL_TAB)
 
+    @staticmethod
+    def _prepare_origami_display_contrast(cached_render):
+        key = (id(cached_render["image"]), float(cached_render["min_density"]),
+               float(cached_render["max_density"]))
+        if cached_render.get("_display_contrast_key") != key:
+            contrast, limits = scale_density_like_picasso(
+                np.asarray(cached_render["image"], dtype=float), key[1], key[2],
+            )
+            cached_render["_display_contrast"] = contrast
+            cached_render["_display_density_limits"] = limits
+            cached_render["_display_contrast_key"] = key
+        return cached_render["_display_contrast"], cached_render["_display_density_limits"]
+
     def _draw_origami_source_density(
         self,
         axis: Any,
@@ -12257,15 +12536,10 @@ class PaintAnalysisApp(tk.Tk):
     ) -> dict[str, object]:
         cached_render = self.origami_source_render_result if render_result is None else render_result
         if cached_render is not None:
-            raw_image = np.asarray(cached_render["image"], dtype=float)
-            contrast, density_limits = scale_density_like_picasso(
-                raw_image,
-                float(cached_render["min_density"]),
-                float(cached_render["max_density"]),
-            )
+            contrast, density_limits = PaintAnalysisApp._prepare_origami_display_contrast(cached_render)
             extent = tuple(float(value) for value in cached_render["extent"])
-            pixel_x = (extent[1] - extent[0]) / max(1, raw_image.shape[1])
-            pixel_y = (extent[3] - extent[2]) / max(1, raw_image.shape[0])
+            pixel_x = (extent[1] - extent[0]) / max(1, contrast.shape[1])
+            pixel_y = (extent[3] - extent[2]) / max(1, contrast.shape[0])
             preview: dict[str, object] = {
                 "contrast": contrast,
                 "extent": extent,
@@ -12296,6 +12570,11 @@ class PaintAnalysisApp(tk.Tk):
             vmin=0.0,
             vmax=1.0,
         )
+        # Diagnostic artists annotate this viewport; they must never resize
+        # it. In Matplotlib 3.11 add_collection also autoscales view limits,
+        # which otherwise starts another footprint/zoom refresh on each draw.
+        axis.set_xlim(extent[0], extent[1])
+        axis.set_ylim(extent[2], extent[3])
         self.origami_source_density_artist = image
         axis.set_position(ORIGAMI_SOURCE_AXES_RECT)
         axis.set_anchor("C")
@@ -12402,6 +12681,8 @@ class PaintAnalysisApp(tk.Tk):
         x0, x1 = sorted(float(value) for value in axis.get_xlim())
         y0, y1 = sorted(float(value) for value in axis.get_ylim())
         show_sites = bool(self.origami_show_theoretical_overlay.get())
+        dark_toggle = getattr(self, "origami_show_dark_overlay", None)
+        show_dark = dark_toggle is not None and bool(dark_toggle.get())
         alignment_toggle = getattr(self, "origami_show_alignment_overlay", None)
         show_alignment = bool(alignment_toggle.get()) if alignment_toggle is not None else False
         show_detected = bool(self.origami_show_detected_sites_overlay.get())
@@ -12486,6 +12767,9 @@ class PaintAnalysisApp(tk.Tk):
                 center = np.mean(corners, axis=0)
                 fitted_centers.append(center)
                 fitted_grid = theoretical_grid_in_footprint(picks.template_points_nm, corners)
+                if show_dark:
+                    self.origami_footprint_artists.extend(draw_digital_dark_space(
+                        axis, params, lambda points: theoretical_grid_in_footprint(points, corners)))
                 if show_sites:
                     displayed_overlay_grid = overlay_grid
                     if show_diagnostics:
@@ -13871,11 +14155,12 @@ class PaintAnalysisApp(tk.Tk):
         )
 
     def _active_origami_picks_and_params(self) -> tuple[OrigamiPickResult, dict[str, Any]] | None:
-        position = int(self.origami_roi_history_position)
-        if 0 <= position < len(self.origami_roi_history):
-            payload = self.origami_roi_history[position]
+        position = int(self.__dict__.get("origami_roi_history_position", -1))
+        history = self.__dict__.get("origami_roi_history", ())
+        if 0 <= position < len(history):
+            payload = history[position]
             return payload["picks"], dict(payload["identification_params"])
-        if self.origami_pick_result is None:
+        if self.__dict__.get("origami_pick_result") is None:
             return None
         return self.origami_pick_result, dict(self.origami_identification_params or {})
 
@@ -14066,9 +14351,8 @@ class PaintAnalysisApp(tk.Tk):
         corner_toggle = getattr(self, "origami_show_corner_diagnostics", None)
         show_corners = corner_toggle is not None and bool(corner_toggle.get())
         show_labels = bool(self.origami_show_text_statistics.get())
-        # Rejected poses are diagnostic results rather than identified
-        # origamis. Keep every part of those fits hidden unless the user asks
-        # for the text-statistics view that explains why they failed.
+        # Steps 2 and 3 inspect fitted candidates, including failed fits.
+        # Acceptance must not silently disable their requested QC overlays.
         active = self._active_origami_picks_and_params()
         unclassified_params = active[1] if active is not None and active[0] is picks else dict(self.origami_identification_params or {})
         if unclassified_params.get("_unclassified_display"):
@@ -14082,7 +14366,8 @@ class PaintAnalysisApp(tk.Tk):
                 if index < len(dispositions) and str(dispositions[index]).startswith("unclassified")
             ]
             self.origami_footprint_artists.extend(draw_unclassified_theoretical_overlay(axis, details))
-        if not show_labels and not show_corners:
+        inspection_preview = int(unclassified_params.get("_inspection_stage", 5)) in {3, 4}
+        if not inspection_preview and not show_labels and not show_corners:
             visible = visible[np.asarray(picks.accepted_mask[visible], dtype=bool)]
         displayed_visible = len(visible)
         maximum_outlines = 500
@@ -14091,6 +14376,8 @@ class PaintAnalysisApp(tk.Tk):
         accepted_numbers = np.cumsum(picks.accepted_mask.astype(int))
         colors = matplotlib.colormaps.get_cmap("tab20")
         show_theoretical = bool(self.origami_show_theoretical_overlay.get())
+        dark_toggle = getattr(self, "origami_show_dark_overlay", None)
+        show_dark = dark_toggle is not None and bool(dark_toggle.get())
         alignment_toggle = getattr(self, "origami_show_alignment_overlay", None)
         show_alignment = bool(alignment_toggle.get()) if alignment_toggle is not None else False
         show_detected_sites = bool(self.origami_show_detected_sites_overlay.get())
@@ -14107,6 +14394,17 @@ class PaintAnalysisApp(tk.Tk):
         active = self._active_origami_picks_and_params()
         if active is not None and active[0] is picks:
             params = active[1]
+        rejected_visible = int(np.count_nonzero(~np.asarray(picks.accepted_mask[visible], dtype=bool)))
+        if inspection_preview and rejected_visible and not show_labels:
+            note = axis.text(
+                .01, .99,
+                f"Inspecting {displayed_visible} fits, including {rejected_visible} failed fits.\n"
+                "Overlays show fitted poses; enable text statistics for failure reasons.",
+                transform=axis.transAxes, va="top", color="white", fontsize=8, zorder=15,
+                bbox={"facecolor": "#111827", "alpha": .85, "edgecolor": "none"},
+            )
+            note.set_in_layout(False)
+            self.origami_footprint_artists.append(note)
         theoretical_grid = np.empty((0, 2), dtype=float)
         overlay_grid = np.empty((0, 2), dtype=float)
         theoretical_positions: list[np.ndarray] = []
@@ -14127,7 +14425,7 @@ class PaintAnalysisApp(tk.Tk):
         show_digital_localization_assignments = (
             show_group_assignments and displayed_visible <= 50
         )
-        if show_theoretical or show_alignment or show_detected_sites or show_site_diagnostics or show_group_assignments or show_prominence_geometry:
+        if show_theoretical or show_dark or show_alignment or show_detected_sites or show_site_diagnostics or show_group_assignments or show_prominence_geometry:
             theoretical_grid = np.asarray(picks.template_points_nm, dtype=float)
             if not len(theoretical_grid):
                 theoretical_grid = origami_grid_points(int(params.get("rows", self.origami_rows.get())), int(params.get("columns", self.origami_columns.get())), float(params.get("spacing_x_nm", self.origami_spacing_x_nm.get())), float(params.get("spacing_y_nm", self.origami_spacing_y_nm.get())), params)
@@ -14142,12 +14440,15 @@ class PaintAnalysisApp(tk.Tk):
                     picks.rectangle_corners_nm[region_index],
                 )
                 dispositions = params.get("classification_dispositions", ())
+                if show_dark:
+                    self.origami_footprint_artists.extend(draw_digital_dark_space(
+                        axis, params, lambda points: theoretical_grid_in_footprint(points, picks.rectangle_corners_nm[region_index])))
                 unclassified_exact = (params.get("classification_method") == "exact digital ON/OFF lookup"
                                       and region_index < len(dispositions)
                                       and str(dispositions[region_index]).startswith("unclassified"))
                 if show_theoretical and not unclassified_exact:
-                    displayed_overlay_grid = overlay_grid
-                    if show_site_diagnostics:
+                    displayed_overlay_grid = alignment_grid if inspection_preview and len(alignment_grid) else overlay_grid
+                    if show_site_diagnostics and not inspection_preview:
                         decision_overlay_grid = digital_group_decision_overlay_points(
                             theoretical_grid,
                             params,
@@ -14161,7 +14462,7 @@ class PaintAnalysisApp(tk.Tk):
                             picks.rectangle_corners_nm[region_index],
                         )
                     )
-                    theoretical_colors.extend([color] * len(displayed_overlay_grid))
+                    theoretical_colors.extend(["#fde047" if inspection_preview else color] * len(displayed_overlay_grid))
                 if show_alignment and len(alignment_grid):
                     self.origami_footprint_artists.extend(draw_alignment_dark_boundary(axis, picks, lambda points: theoretical_grid_in_footprint(points, picks.rectangle_corners_nm[region_index])))
                     alignment_positions.append(
@@ -14422,6 +14723,9 @@ class PaintAnalysisApp(tk.Tk):
                         failure_reasons.append("digital ON/OFF pattern differs from template")
                     if not required_fiducial_mask(picks, params, region_index)[0]:
                         failure_reasons.append("independent fiducial end support missing")
+                    dark_failure = dark_alignment_failure_reason(picks, params, region_index)
+                    if dark_failure:
+                        failure_reasons.append(dark_failure)
                     if not required_corner_mask(picks, params, region_index)[0]:
                         failure_reasons.append("required corner support missing")
                     dispositions = params.get("classification_dispositions", ())
@@ -14461,10 +14765,25 @@ class PaintAnalysisApp(tk.Tk):
                 linewidths=0.9,
                 alpha=0.95,
                 zorder=4,
-                label="Theoretical docking sites",
+                label="Expected bright sites" if inspection_preview else "Theoretical docking sites",
             )
             site_overlay.set_in_layout(False)
             self.origami_footprint_artists.append(site_overlay)
+        if inspection_preview and (show_theoretical or show_dark) and len(visible):
+            handles = []
+            if theoretical_positions:
+                handles.append(matplotlib.lines.Line2D([], [], marker="o", linestyle="none",
+                               markerfacecolor="none", markeredgecolor="#fde047", label="Expected bright sites"))
+            if show_dark and origami_alignment_dark_groups(params):
+                handles.append(matplotlib.patches.Patch(facecolor=matplotlib.colors.to_rgba("#38bdf8", .25),
+                               edgecolor="#38bdf8", hatch="///", label="Expected dark space"))
+            if handles:
+                legend = axis.legend(handles=handles, loc="upper right", fontsize=8, framealpha=.85)
+                toggle = self.__dict__.get("origami_show_legends")
+                if toggle is not None:
+                    legend.set_visible(bool(toggle.get()))
+                legend.set_in_layout(False)
+                self.origami_footprint_artists.append(legend)
         if alignment_positions:
             positions = np.vstack(alignment_positions)
             alignment_overlay = axis.scatter(
@@ -14884,7 +15203,10 @@ class PaintAnalysisApp(tk.Tk):
         self.origami_canvas.draw_idle()
         overlays: list[str] = []
         if self.origami_show_theoretical_overlay.get():
-            overlays.append("classified-template overlay")
+            overlays.append("bright theoretical overlay")
+        dark_toggle = getattr(self, "origami_show_dark_overlay", None)
+        if dark_toggle is not None and dark_toggle.get():
+            overlays.append("dark theoretical overlay")
         if self.origami_show_alignment_overlay.get():
             overlays.append("Step 2 alignment-template overlay")
         if self.origami_show_detected_sites_overlay.get():
@@ -15678,6 +16000,9 @@ class PaintAnalysisApp(tk.Tk):
                     supported_columns=int(picks.supported_column_count[i]), spacing_error_nm=float(picks.site_spacing_max_error_nm[i]), params=params)
                 if not required_fiducial_mask(picks, params, i)[0]:
                     reasons.append("independent fiducial end support missing")
+                dark_failure = dark_alignment_failure_reason(picks, params, i)
+                if dark_failure:
+                    reasons.append(dark_failure)
                 if not required_corner_mask(picks, params, i)[0]:
                     reasons.append("required corner support missing")
                 overlap = picks.footprint_overlap_fraction
@@ -16114,7 +16439,7 @@ class PaintAnalysisApp(tk.Tk):
                 # of the group order in the uploaded schema.
                 zorder=6.0 if color == "#ff3030" else 5.8,
             )
-            axis.add_collection(collection)
+            axis.add_collection(collection, autolim=False)
             collection.set_in_layout(False)
             artists.append(collection)
         return artists
@@ -16276,6 +16601,12 @@ class PaintAnalysisApp(tk.Tk):
             handles = self._draw_digital_group_blobs(axis, grid)
             if model is None:
                 handles.append(axis.scatter(grid[:, 0], grid[:, 1], s=55, facecolors="none", edgecolors="#22d3ee", linewidths=1.2, label="analog sites", zorder=4))
+        if enabled("dark_overlay"):
+            active = self._active_origami_picks_and_params()
+            gap_params = dict(active[1] if active is not None else (self.origami_identification_params or {}))
+            if draw_digital_dark_space(axis, gap_params):
+                handles.append(matplotlib.patches.Patch(facecolor="#38bdf8", alpha=.25,
+                               hatch="///", label="Expected dark space"))
         if handles:
             axis.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.78)
         if not any(enabled(name) for name in ("alignment_overlay", "detected_sites_overlay", "site_diagnostics", "localization_group_assignments", "prominence_geometry")):
@@ -16345,7 +16676,7 @@ class PaintAnalysisApp(tk.Tk):
             return toggle is not None and bool(toggle.get())
 
         if not any(enabled(name) for name in (
-            "origami_show_alignment_overlay", "origami_show_detected_sites_overlay",
+            "origami_show_theoretical_overlay", "origami_show_dark_overlay", "origami_show_alignment_overlay", "origami_show_detected_sites_overlay",
             "origami_show_site_diagnostics", "origami_show_localization_group_assignments",
             "origami_show_prominence_geometry",
         )):
@@ -16353,6 +16684,8 @@ class PaintAnalysisApp(tk.Tk):
         points = np.asarray(result.aligned_points[index], dtype=float)
         active = self._active_origami_picks_and_params()
         params = dict(active[1] if active is not None else (self.origami_identification_params or {}))
+        if enabled("origami_show_dark_overlay"):
+            draw_digital_dark_space(axis, params, transform)
         model = self._active_origami_digital_pixel_model()
         if model is not None:
             params["digital_pixel_model"] = model
