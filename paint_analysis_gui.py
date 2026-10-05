@@ -94,7 +94,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 
-APP_TITLE = "DNA PAINT Picasso-Style ROI Analyzer"
+APP_VERSION = "1.0.0"
+APP_TITLE = f"DNA PAINT Picasso-Style ROI Analyzer v{APP_VERSION}"
 DEFAULT_DATA_DIR = Path.home() / "Desktop" / "LBNL_PAINT"
 DEFAULT_PIXEL_SIZE_NM = 130.0
 DEFAULT_ORIGAMI_PICK_BIN_NM = 5.0
